@@ -38,6 +38,10 @@ async function requestHttpsIpv4(
 ): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
   const url = new URL(targetUrl);
   const { address } = await dnsPromises.lookup(url.hostname, { family: 4 });
+  // Block private/loopback/link-local to mitigate SSRF (applies to cover + gateway proxies)
+  if (/^(127\.|10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[0-1])\.|169\.254\.|0\.0\.0\.0$|::1|fe80:|fc00:|fd00:)/i.test(address)) {
+    throw new Error("Refusing to connect to private/loopback address");
+  }
   const payload = options.body ?? "";
   const method = options.method ?? (payload ? "POST" : "GET");
   const reqHeaders: Record<string, string> = {
@@ -127,6 +131,39 @@ function getGeminiClient(): GoogleGenAI | null {
     });
   }
   return aiClient;
+}
+
+// Server-side analysis config from .env (read via dotenv.config() at startup).
+// Allows "make it read from the env file instead of the browser input".
+// XAI_API_KEY is recognized and sets sensible xAI Responses API defaults (matches the /v1/responses curl format).
+const SERVER_ANALYSIS_API_KEY = process.env.ANALYSIS_API_KEY || process.env.XAI_API_KEY || "";
+const SERVER_ANALYSIS_API_ENDPOINT = process.env.ANALYSIS_API_ENDPOINT || (process.env.XAI_API_KEY ? "https://api.x.ai/v1/responses" : "");
+const SERVER_ANALYSIS_API_MODEL = process.env.ANALYSIS_API_MODEL || (process.env.XAI_API_KEY ? "grok-4.3" : "");
+
+function isConcreteSecret(value?: string): boolean {
+  // Keep EXACTLY in sync with src/api.ts:isConcreteSecret + stripShellValue (dupe risk noted in review).
+  if (!value) return false;
+  const cleaned = value
+    .trim()
+    .replace(/^['"`]+|['"`]+$/g, "")
+    .replace(/[),;]+$/g, "")
+    .trim();
+  if (!cleaned) return false;
+  if (/^\$|process\.env|os\.environ|your[_-]?|example|placeholder|<|>|\{|\}/i.test(cleaned)) return false;
+  if (/^[A-Z0-9_]+_API_KEY$/i.test(cleaned)) return false;
+  return cleaned.length >= 8;
+}
+
+function resolveAnalysisConfig(clientConfig: any) {
+  const clientEndpoint = clientConfig?.endpoint ? String(clientConfig.endpoint).trim() : "";
+  const clientModel = clientConfig?.model ? String(clientConfig.model).trim() : "";
+  const clientKey = clientConfig?.apiKey ? String(clientConfig.apiKey).trim() : "";
+  const useServerKey = !isConcreteSecret(clientKey) && isConcreteSecret(SERVER_ANALYSIS_API_KEY);
+  return {
+    endpoint: clientEndpoint || SERVER_ANALYSIS_API_ENDPOINT || "https://ark.cn-beijing.volces.com/api/v3/responses",
+    apiKey: useServerKey ? SERVER_ANALYSIS_API_KEY : clientKey,
+    model: clientModel || SERVER_ANALYSIS_API_MODEL || "doubao-seed-2-0-lite-260428"
+  };
 }
 
 const app = express();
@@ -509,21 +546,39 @@ async function callConfiguredResponsesApi(config: any, prompt: string): Promise<
 }
 
 app.post("/api/analysis/test", async (req, res) => {
-  const { analysisConfig } = req.body;
+  const clientConfig = req.body?.analysisConfig || {};
+  const analysisConfig = resolveAnalysisConfig(clientConfig);
 
   try {
     await callConfiguredResponsesApi(
       analysisConfig,
       '请只返回严格 JSON：{"ok":true,"message":"pong"}'
     );
-    res.json({ ok: true, model: analysisConfig?.model || "未命名模型" });
+    res.json({ ok: true, model: analysisConfig.model, usingServerKey: !isConcreteSecret(clientConfig?.apiKey || "") && isConcreteSecret(SERVER_ANALYSIS_API_KEY) });
   } catch (error: any) {
     res.status(502).json({
       ok: false,
-      model: analysisConfig?.model || "未命名模型",
-      message: error?.message || "分析模型连接失败"
+      model: analysisConfig.model,
+      message: "分析模型连接失败"
     });
   }
+});
+
+// Status for client UI: tells whether server .env provides a key so the browser key input can be optional.
+app.get("/api/analysis/status", (_req, res) => {
+  const hasServer = isConcreteSecret(SERVER_ANALYSIS_API_KEY);
+  res.json({
+    hasServerAnalysisKey: hasServer,
+    serverEndpoint: hasServer ? SERVER_ANALYSIS_API_ENDPOINT : null,
+    serverModel: hasServer ? SERVER_ANALYSIS_API_MODEL : null
+  });
+});
+
+// Status for client UI (weread data source): tells whether server .env provides WEREAD_API_KEY
+// so browser settings key can be left blank; server will fallback using the env value for sync/proxy/scheduler matching.
+app.get("/api/weread/status", (_req, res) => {
+  const hasServer = isConcreteSecret(process.env.WEREAD_API_KEY);
+  res.json({ hasServerWereadKey: hasServer });
 });
 
 // 1. WeChat Reading Gateway Proxy Route
@@ -537,6 +592,22 @@ app.post("/api/weread/proxy", async (req, res) => {
   }
 
   const gatewayUrl = targetUrl || "https://i.weread.qq.com/api/agent/gateway";
+  // Whitelist for gateway/skill hosts (prevent abuse, similar to cover proxy)
+  try {
+    const u = new URL(gatewayUrl);
+    const h = u.hostname.toLowerCase();
+    const ok = h.endsWith("weread.qq.com") || h.endsWith("wr.qq.com") || h.endsWith("duokan.com");
+    if (!ok) return res.status(400).json({ errcode: -1, errmsg: "Invalid gateway host" });
+    if (skillUrl) {
+      const su = new URL(skillUrl);
+      const sh = su.hostname.toLowerCase();
+      if (!sh.endsWith("weread.qq.com") && !sh.endsWith("duokan.com")) {
+        return res.status(400).json({ errcode: -1, errmsg: "Invalid skill host" });
+      }
+    }
+  } catch {
+    return res.status(400).json({ errcode: -1, errmsg: "Invalid gateway/skill URL" });
+  }
   const requestBody = {
     api_name: api_name || "/_list",
     skill_version: skill_version || "1.0.5",
@@ -564,7 +635,7 @@ app.post("/api/weread/proxy", async (req, res) => {
     const timeoutMessage = error?.name === "AbortError"
       ? `Proxy request timed out after ${Math.round(WEREAD_GATEWAY_TIMEOUT_MS / 1000)} seconds`
       : error?.message || error;
-    res.status(500).json({ errcode: 500, errmsg: `Proxy request failed: ${timeoutMessage}` });
+    res.status(500).json({ errcode: 500, errmsg: "Proxy request failed" });
   } finally {
     clearTimeout(timeout);
   }
@@ -576,14 +647,59 @@ app.get("/api/weread/proxy-cover", async (req, res) => {
   if (!url) {
     return res.status(400).send("Missing URL parameter");
   }
+  // Basic whitelist for weread CDN/hosts (prevent open proxy abuse)
+  try {
+    const u = new URL(url);
+    const host = u.hostname.toLowerCase();
+    const allowed = host.endsWith("weread.qq.com") || host.endsWith("wr.qq.com") || host.endsWith("duokan.com") || host.endsWith("cdn.weread.qq.com");
+    if (!allowed) {
+      return res.status(400).send("Invalid cover host");
+    }
+  } catch {
+    return res.status(400).send("Invalid URL");
+  }
+
+  // Timeout wrapper (reuse signal support in requestHttpsIpv4)
+  const controller = new AbortController();
+  let timeout = setTimeout(() => controller.abort(), 8000);
 
   try {
-    const response = await requestHttpsIpv4(url, {
+    let response = await requestHttpsIpv4(url, {
+      signal: controller.signal,
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://weread.qq.com/"
       }
     });
+    // Minimal one-level redirect follow for CDN 302s common on covers
+    if (response.status >= 300 && response.status < 400) {
+      const locHeader = (Array.isArray(response.headers.location) ? response.headers.location[0] : response.headers.location) || "";
+      if (locHeader) {
+        clearTimeout(timeout);
+        const target = locHeader.startsWith("http") ? locHeader : new URL(locHeader, url).toString();
+        // Re-validate whitelist on redirect target (prevent SSRF via 302 from allowed host)
+        try {
+          const tu = new URL(target);
+          const thost = tu.hostname.toLowerCase();
+          const tallowed = thost.endsWith("weread.qq.com") || thost.endsWith("wr.qq.com") || thost.endsWith("duokan.com") || thost.endsWith("cdn.weread.qq.com");
+          if (!tallowed) {
+            throw new Error("Redirect to invalid cover host");
+          }
+        } catch {
+          throw new Error("Invalid redirect target");
+        }
+        timeout = setTimeout(() => controller.abort(), 8000);
+        response = await requestHttpsIpv4(target, {
+          signal: controller.signal,
+          headers: {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Referer": "https://weread.qq.com/"
+          }
+        });
+        clearTimeout(timeout);
+      }
+    }
+    if (timeout) clearTimeout(timeout);
     if (response.status < 200 || response.status >= 300) {
       throw new Error(`Failed to fetch cover. Status: ${response.status}`);
     }
@@ -597,18 +713,25 @@ app.get("/api/weread/proxy-cover", async (req, res) => {
     res.setHeader("Cache-Control", "public, max-age=86400"); // Cache for 24 hours
     res.send(response.body);
   } catch (error: any) {
+    if (timeout) clearTimeout(timeout);
     console.error("WeRead Cover Proxy Error:", error);
+    // Return non-image so <img> reliably triggers onError -> fallback (no mixed content type issues)
     res.status(500).send("Failed to load cover image");
   }
 });
 
 // 2. Server-side Gemini Reading Personality and Mindmap Analyzer (Lazy-initialized & handles missing key)
 app.post("/api/weread/analyze", async (req, res) => {
-  const { books, highlights, analysisConfig } = req.body;
+  const { books, highlights, analysisConfig: clientAnalysisConfig } = req.body;
 
   if (!books || !Array.isArray(books) || books.length === 0) {
     return res.status(400).json({ error: "Missing books list for analysis" });
   }
+  if (books.length > 500) {
+    return res.status(400).json({ error: "Too many books for analysis (max 500)" });
+  }
+
+  const analysisConfig = resolveAnalysisConfig(clientAnalysisConfig);
 
   const normalizedBooks = books.map((item: any) => {
     const book = item?.book || item;
@@ -646,7 +769,7 @@ ${quoteSamples || "暂无划线样本"}
 
 请严格按 prompt 要求返回 JSON。yearlyPersonality 中每一年必须只包含 year、title、annualQuestion、description。`;
 
-  if (analysisConfig?.endpoint && analysisConfig?.apiKey && analysisConfig?.model) {
+  if (analysisConfig?.endpoint && isConcreteSecret(analysisConfig?.apiKey) && analysisConfig?.model) {
     try {
       const result = completeAnalysisYears(
         await callConfiguredResponsesApi(analysisConfig, finalPrompt),
@@ -668,7 +791,7 @@ ${quoteSamples || "暂无划线样本"}
         isAiGenerated: false,
         analysisModel: analysisConfig.model,
         analysisProvider: "configured",
-        error: error?.message || "Configured analysis service unavailable, fallback to semantic analyzer"
+        error: "Analysis service unavailable"
       });
     }
   }
@@ -750,7 +873,7 @@ ${quoteSamples || "暂无划线样本"}
       isAiGenerated: false,
       analysisModel: "gemini-3.5-flash",
       analysisProvider: "gemini",
-      error: error?.message || "Gemini service temporary unavailable, fallback to semantic analyzer"
+      error: "Analysis service unavailable"
     });
   }
 });

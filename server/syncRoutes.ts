@@ -14,9 +14,16 @@ function parseCredentials(req: Request): {
   skillVersion: string;
 } | null {
   const auth = req.headers.authorization || "";
-  const apiKey = auth.replace(/^Bearer\s+/i, "").trim()
+  let apiKey = auth.replace(/^Bearer\s+/i, "").trim()
     || String(req.body?.apiKey || "").trim();
-  if (!apiKey || apiKey.length < 8) return null;
+  if (!apiKey || apiKey.length < 8) {
+    const envKey = (process.env.WEREAD_API_KEY || "").trim();
+    if (envKey && envKey.length >= 8) {
+      apiKey = envKey;
+    } else {
+      return null;
+    }
+  }
 
   const gatewayUrl = String(
     req.headers["x-weread-gateway-url"] || req.body?.gatewayUrl || DEFAULT_GATEWAY

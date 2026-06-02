@@ -83,13 +83,14 @@ npm run dev
 
 | 变量 | 说明 |
 |------|------|
-| `WEREAD_API_KEY` | 微信读书网关 Token（服务端代理与定时刷新） |
+| `WEREAD_API_KEY` | 微信读书网关 Token（服务端代理、定时刷新、及可选的浏览器数据加载后备）。设置后「数据源设置」面板的 API Key 可留空，由服务器回退读取 .env。 |
 | `WEREAD_API_URL` | 网关地址（默认官方 Agent Gateway） |
 | `WEREAD_SERVER_SYNC` | `1` 启用 SQLite 缓存（默认）；`0` 仅用浏览器全量拉取 |
 | `SERVER_SECRET` | 可选，32+ 字符，用于加密存储 API Key 以支持无浏览器定时刷新 |
 | `GEMINI_API_KEY` | 可选，服务端 Gemini 分析 |
+| `XAI_API_KEY` / `ANALYSIS_API_KEY` | 可选，服务端外部模型分析（xAI Grok / OpenAI 等）。设置后浏览器「分析模型」面板的 Key 可留空，由服务器读取 .env（优先级：客户端提供 > 服务端 env）。支持 Responses/Chat 格式。 |
 
-浏览器 **Settings** 中的 Token 会随 `Authorization` 头传给 snapshot/sync；与 `.env` 中的 key 应对同一账号。
+浏览器「数据源设置」中的 Token 会随 Authorization 头传给 snapshot/sync（若留空且服务端 .env 有 WEREAD_API_KEY 则自动使用服务端值）。与 `.env` 中的 key 应对同一账号以便后台刷新匹配。
 
 ## 常用命令
 

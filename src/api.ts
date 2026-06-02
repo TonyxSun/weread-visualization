@@ -65,23 +65,32 @@ export interface WeReadSyncStatusResponse {
   error?: string;
 }
 
-function wereadServerAuthHeaders(): Record<string, string> {
-  const apiKey = getStoredApiKey();
+async function wereadServerAuthHeaders(): Promise<Record<string, string>> {
+  let apiKey = getStoredApiKey();
+  let useServer = false;
   if (!isConcreteSecret(apiKey)) {
-    throw new Error("API Key (Bearer Token) is required");
+    const st = await getServerWereadStatus().catch(() => ({ hasServerWereadKey: false }));
+    if (st.hasServerWereadKey) {
+      useServer = true;
+    } else {
+      throw new Error("API Key (Bearer Token) is required");
+    }
   }
-  return {
-    Authorization: `Bearer ${stripShellValue(apiKey)}`,
+  const headers: Record<string, string> = {
     "X-WeRead-Gateway-Url": getStoredGatewayUrl(),
     "X-WeRead-Skill-Version": getStoredSkillVersion(),
     "Content-Type": "application/json"
   };
+  if (!useServer) {
+    headers.Authorization = `Bearer ${stripShellValue(apiKey)}`;
+  }
+  return headers;
 }
 
 export async function fetchSnapshot(): Promise<WeReadSnapshotResponse> {
   const response = await fetch("/api/weread/snapshot", {
     method: "POST",
-    headers: wereadServerAuthHeaders()
+    headers: await wereadServerAuthHeaders()
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -93,7 +102,7 @@ export async function fetchSnapshot(): Promise<WeReadSnapshotResponse> {
 export async function triggerSync(force = false): Promise<WeReadSyncStartResponse> {
   const response = await fetch("/api/weread/sync", {
     method: "POST",
-    headers: wereadServerAuthHeaders(),
+    headers: await wereadServerAuthHeaders(),
     body: JSON.stringify({ force })
   });
   const result = await response.json().catch(() => ({}));
@@ -104,7 +113,7 @@ export async function triggerSync(force = false): Promise<WeReadSyncStartRespons
 }
 
 export async function pollSyncStatus(syncRunId: number): Promise<WeReadSyncStatusResponse> {
-  const headers = wereadServerAuthHeaders();
+  const headers = await wereadServerAuthHeaders();
   const response = await fetch(`/api/weread/sync/status?syncRunId=${syncRunId}`, { headers });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) {
@@ -422,12 +431,17 @@ export function parseAnalysisCurl(raw: string): Partial<AnalysisApiConfig> {
  * Universal safe query execution going through our Express proxy
  */
 async function callWeReadProxy(apiName: string, params: any = {}): Promise<any> {
-  const apiKey = getStoredApiKey();
+  let apiKey = getStoredApiKey();
   const gatewayUrl = getStoredGatewayUrl();
   const skillVersion = getStoredSkillVersion();
 
   if (!isConcreteSecret(apiKey)) {
-    throw new Error("API Key (Bearer Token) is required");
+    const st = await getServerWereadStatus().catch(() => ({ hasServerWereadKey: false }));
+    if (st.hasServerWereadKey) {
+      apiKey = "";
+    } else {
+      throw new Error("API Key (Bearer Token) is required");
+    }
   }
 
   let lastError: Error | null = null;
@@ -612,6 +626,26 @@ export async function testAnalysisApiConfig(config: AnalysisApiConfig): Promise<
   }
 
   return result;
+}
+
+export async function getServerAnalysisStatus(): Promise<{ hasServerAnalysisKey: boolean; serverEndpoint?: string | null; serverModel?: string | null }> {
+  try {
+    const r = await fetch("/api/analysis/status");
+    if (r.ok) return await r.json();
+  } catch {
+    // ignore network / SSR
+  }
+  return { hasServerAnalysisKey: false };
+}
+
+export async function getServerWereadStatus(): Promise<{ hasServerWereadKey: boolean }> {
+  try {
+    const r = await fetch("/api/weread/status");
+    if (r.ok) return await r.json();
+  } catch {
+    // ignore network / SSR
+  }
+  return { hasServerWereadKey: false };
 }
 
 // ==========================================

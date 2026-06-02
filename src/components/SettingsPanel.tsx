@@ -3,12 +3,13 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Settings, Key, RefreshCw, X, TerminalSquare, ClipboardPaste } from "lucide-react";
 import {
   DEFAULT_SKILL_INSTALL_COMMAND,
   getStoredApiKey,
   getStoredSkillInstallCommand,
+  getServerWereadStatus,
   setStoredApiKey,
   setStoredSkillInstallCommand
 } from "../api";
@@ -25,6 +26,17 @@ export default function SettingsPanel({ onRefresh, isLoading, initiallyOpen = fa
   const [installCommand, setInstallCommand] = useState(getStoredSkillInstallCommand());
   const [pasteText, setPasteText] = useState("");
   const [message, setMessage] = useState<string | null>(null);
+  const [wereadServerStatus, setWereadServerStatus] = useState<{ hasServerWereadKey?: boolean }>({});
+
+  useEffect(() => {
+    getServerWereadStatus().then(setWereadServerStatus).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (isOpen) {
+      getServerWereadStatus().then(setWereadServerStatus).catch(() => {});
+    }
+  }, [isOpen]);
 
   const applyPastedConfig = (raw: string) => {
     const text = raw.trim();
@@ -48,8 +60,9 @@ export default function SettingsPanel({ onRefresh, isLoading, initiallyOpen = fa
       setMessage("请填写 Skill 安装指令。");
       return;
     }
-    if (!apiKey.trim()) {
-      setMessage("API Key 不能为空。");
+    const hasServer = !!wereadServerStatus.hasServerWereadKey;
+    if (!apiKey.trim() && !hasServer) {
+      setMessage("API Key 不能为空，或在服务端 .env 设置 WEREAD_API_KEY 后留空使用服务端密钥。");
       return;
     }
 
@@ -75,7 +88,7 @@ export default function SettingsPanel({ onRefresh, isLoading, initiallyOpen = fa
       </button>
 
       {isOpen && (
-        <div className="absolute right-0 top-12 w-[420px] bg-[#FAF9F6] border border-[#2C2C26]/15 rounded-lg shadow-md p-5 font-sans text-[#2C2C26] animate-in fade-in slide-in-from-top-2 duration-200">
+        <div className="fixed left-3 right-3 top-14 z-[200] max-h-[min(80vh,640px)] overflow-y-auto sm:absolute sm:left-auto sm:right-0 sm:top-12 sm:w-[420px] sm:max-h-none bg-[#FAF9F6] border border-[#2C2C26]/15 rounded-lg shadow-md p-5 font-sans text-[#2C2C26] animate-in fade-in slide-in-from-top-2 duration-200">
           <div className="flex items-center justify-between border-b border-[#2C2C26]/10 pb-3 mb-4">
             <h3 className="font-sans font-medium text-sm tracking-wide text-[#2C2C26] flex items-center gap-1.5">
               <RefreshCw className="w-4 h-4 text-[#2C2C26]/60" />
@@ -129,9 +142,23 @@ export default function SettingsPanel({ onRefresh, isLoading, initiallyOpen = fa
                 type="text"
                 value={apiKey}
                 onChange={(e) => setApiKey(e.target.value)}
-                placeholder="<WEREAD_API_KEY>"
+                placeholder={wereadServerStatus.hasServerWereadKey ? "(可选，留空使用服务端 .env)" : "<WEREAD_API_KEY>"}
                 className="w-full px-3 py-1.5 bg-white border border-[#2C2C26]/10 rounded text-sm text-[#2C2C26] font-mono focus:outline-none focus:ring-1 focus:ring-[#2C2C26] focus:border-[#2C2C26] placeholder-[#2C2C26]/30"
               />
+              {wereadServerStatus.hasServerWereadKey && (
+                <div className="flex items-center gap-2 mt-1">
+                  <p className="text-[10px] text-emerald-700/90 leading-tight flex-1">
+                    服务端 .env 已配置 WEREAD_API_KEY。留空则由服务器读取密钥加载数据。
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setApiKey("")}
+                    className="text-[10px] px-1.5 py-0.5 border border-emerald-700/40 rounded hover:bg-emerald-50 font-mono"
+                  >
+                    使用服务端密钥
+                  </button>
+                </div>
+              )}
             </div>
 
             {message && (
