@@ -811,8 +811,23 @@ const distPath = path.join(process.cwd(), "dist");
 
 async function setupServer() {
   if (!isProduction) {
+    const hmrHost = process.env.VITE_HMR_HOST;
+    const hmrProtocol = process.env.VITE_HMR_PROTOCOL as "ws" | "wss" | undefined;
+    const hmrClientPort = process.env.VITE_HMR_CLIENT_PORT
+      ? Number(process.env.VITE_HMR_CLIENT_PORT)
+      : undefined;
+
     const vite = await createViteServer({
-      server: { middlewareMode: true, hmr: { port: HMR_PORT } },
+      server: {
+        middlewareMode: true,
+        allowedHosts: [".ngrok-free.app", ".ngrok.io", ".ngrok.app", "localhost"],
+        hmr: {
+          port: HMR_PORT,
+          ...(hmrHost ? { host: hmrHost } : {}),
+          ...(hmrProtocol ? { protocol: hmrProtocol } : {}),
+          ...(hmrClientPort ? { clientPort: hmrClientPort } : {})
+        }
+      },
       appType: "spa",
     });
     app.use(vite.middlewares);

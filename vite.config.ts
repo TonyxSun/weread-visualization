@@ -14,6 +14,8 @@ export default defineConfig(() => {
       },
     },
     server: {
+      // Allow ngrok and other tunnel Host headers in dev (avoids Vite "Blocked request").
+      allowedHosts: [".ngrok-free.app", ".ngrok.io", ".ngrok.app", "localhost"],
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modifyâfile watching is disabled to prevent flickering during agent edits.
       hmr: process.env.DISABLE_HMR !== 'true',
