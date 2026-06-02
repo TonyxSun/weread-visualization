@@ -16,6 +16,7 @@ import RelationshipMap from "./components/RelationshipMap";
 import CardSwiper from "./components/CardSwiper";
 import ObsidianImporter from "./components/ObsidianImporter";
 import ReadingTrends from "./components/ReadingTrends";
+import IndexingOverlay, { IndexingProgressState } from "./components/IndexingOverlay";
 import { getNotebookTimeInfo } from "./utils/wereadDates";
 
 type DataMode = "weread" | "obsidian";
@@ -252,6 +253,7 @@ async function mapWithConcurrency<T, R>(
 
 export default function App() {
   const [loading, setLoading] = useState<boolean>(true);
+  const [indexingProgress, setIndexingProgress] = useState<IndexingProgressState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [tab, setTab] = useState<"canvas" | "swiper">("canvas");
 
@@ -430,6 +432,7 @@ export default function App() {
 
       setLoading(true);
       setError(null);
+      setIndexingProgress(null);
 
       if (targetMode === "obsidian") {
         const storedStr = localStorage.getItem("weread_obsidian_payload");
@@ -496,26 +499,69 @@ export default function App() {
         return;
       }
 
+      setIndexingProgress({
+        phase: "catalog",
+        completed: 0,
+        total: 0
+      });
+
       // 1. Fetch bookshelf notebooks and general stats
       const [notebooksRes, statsRes] = await Promise.all([
         fetchNotebooks(),
         fetchOverallStats()
       ]);
 
+      const books = notebooksRes.books;
+      const notesCompletedRef = { current: 0 };
+
+      setIndexingProgress({
+        phase: "notes",
+        completed: 0,
+        total: books.length
+      });
+
       // 2. Fetch notes for every synced book in small batches so large libraries can complete.
-      const notesByBook = await mapWithConcurrency(notebooksRes.books, 2, async (bookItem) => {
+      const notesByBook = await mapWithConcurrency(books, 2, async (bookItem) => {
+        setIndexingProgress({
+          phase: "notes",
+          completed: notesCompletedRef.current,
+          total: books.length,
+          currentBookTitle: bookItem.book.title
+        });
+
         try {
           const notesRes = await fetchBookNotes(bookItem.bookId);
-          return (notesRes.updated || []).map((h) => ({
+          const mapped = (notesRes.updated || []).map((h) => ({
             ...h,
             bookName: bookItem.book.title,
             bookAuthor: bookItem.book.author,
             bookCover: bookItem.book.cover
           }));
+          notesCompletedRef.current += 1;
+          setIndexingProgress({
+            phase: "notes",
+            completed: notesCompletedRef.current,
+            total: books.length,
+            currentBookTitle: bookItem.book.title
+          });
+          return mapped;
         } catch (e) {
           console.warn(`Failed downloading notes for ${bookItem.bookId}`, e);
+          notesCompletedRef.current += 1;
+          setIndexingProgress({
+            phase: "notes",
+            completed: notesCompletedRef.current,
+            total: books.length,
+            currentBookTitle: bookItem.book.title
+          });
           return [];
         }
+      });
+
+      setIndexingProgress({
+        phase: "finishing",
+        completed: books.length,
+        total: books.length
       });
 
       const resolvedHighlights = notesByBook.flat();
@@ -544,6 +590,7 @@ export default function App() {
       console.error(err);
       setError(err?.message || "无法拉取微信读书数据，请检查网关和认证Key配置。");
     } finally {
+      setIndexingProgress(null);
       setLoading(false);
     }
   };
@@ -803,20 +850,24 @@ export default function App() {
       <div className="flex-1 flex overflow-hidden relative bg-[#FAF9F6]">
         
         {loading ? (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6]/95 z-40 font-sans">
-            <div className="relative">
-              <Compass className="w-12 h-12 text-[#2C2C26]/40 animate-spin" />
-              <div className="absolute inset-0 flex items-center justify-center text-[10px] text-[#2C2C26] font-normal font-serif">
-                阅
+          indexingProgress ? (
+            <IndexingOverlay progress={indexingProgress} />
+          ) : (
+            <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6]/95 z-40 font-sans">
+              <div className="relative">
+                <Compass className="w-12 h-12 text-[#2C2C26]/40 animate-spin" />
+                <div className="absolute inset-0 flex items-center justify-center text-[10px] text-[#2C2C26] font-normal font-serif">
+                  阅
+                </div>
               </div>
+              <p className="text-sm font-serif text-[#2C2C26]/80 mt-4 tracking-normal">
+                正在解构数据图谱并检索心智线索...
+              </p>
+              <p className="text-[10px] font-sans text-[#2C2C26]/40 mt-1 uppercase tracking-widest font-semibold">
+                Please wait while we chart the contours
+              </p>
             </div>
-            <p className="text-sm font-serif text-[#2C2C26]/80 mt-4 tracking-normal">
-              正在解构数据图谱并检索心智线索...
-            </p>
-            <p className="text-[10px] font-sans text-[#2C2C26]/40 mt-1 uppercase tracking-widest font-semibold">
-              Please wait while we chart the contours
-            </p>
-          </div>
+          )
         ) : error ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6] z-40 text-center p-6_font-sans">
             <AlertCircle className="w-14 h-14 text-red-600/60 mb-4" />
