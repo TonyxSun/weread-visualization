@@ -145,9 +145,22 @@ function inferDefaultAnalysisEndpoint(model = "", sourceText = ""): string | und
   return undefined;
 }
 
+function envWeReadApiKey(): string {
+  const value = import.meta.env.WEREAD_API_KEY;
+  return isConcreteSecret(value) ? stripShellValue(value) : "";
+}
+
+function envWeReadGatewayUrl(): string {
+  const value = import.meta.env.WEREAD_API_URL;
+  const cleaned = value ? stripShellValue(value) : "";
+  return cleaned || DEFAULT_GATEWAY_URL;
+}
+
 export function getStoredApiKey(): string {
   if (typeof window !== "undefined") {
-    return localStorage.getItem(LOCAL_STORAGE_KEY_API_KEY) || DEFAULT_API_KEY;
+    const stored = localStorage.getItem(LOCAL_STORAGE_KEY_API_KEY);
+    if (isConcreteSecret(stored || undefined)) return stripShellValue(stored!);
+    return envWeReadApiKey() || DEFAULT_API_KEY;
   }
   return DEFAULT_API_KEY;
 }
@@ -160,7 +173,9 @@ export function setStoredApiKey(key: string): void {
 
 export function getStoredGatewayUrl(): string {
   if (typeof window !== "undefined") {
-    return localStorage.getItem(LOCAL_STORAGE_KEY_GATEWAY_URL) || DEFAULT_GATEWAY_URL;
+    const stored = localStorage.getItem(LOCAL_STORAGE_KEY_GATEWAY_URL);
+    if (stored?.trim()) return stored.trim();
+    return envWeReadGatewayUrl();
   }
   return DEFAULT_GATEWAY_URL;
 }
@@ -280,6 +295,10 @@ async function callWeReadProxy(apiName: string, params: any = {}): Promise<any> 
   const apiKey = getStoredApiKey();
   const gatewayUrl = getStoredGatewayUrl();
   const skillVersion = getStoredSkillVersion();
+
+  if (!isConcreteSecret(apiKey)) {
+    throw new Error("API Key (Bearer Token) is required");
+  }
 
   let lastError: Error | null = null;
   for (let attempt = 0; attempt <= WEREAD_PROXY_RETRIES; attempt += 1) {

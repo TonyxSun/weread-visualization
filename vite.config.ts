@@ -5,6 +5,8 @@ import {defineConfig} from 'vite';
 
 export default defineConfig(() => {
   return {
+    // Expose WEREAD_* from .env to the client (e.g. WEREAD_API_KEY, WEREAD_API_URL).
+    envPrefix: ["VITE_", "WEREAD_"],
     plugins: [react(), tailwindcss()],
     resolve: {
       alias: {

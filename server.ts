@@ -434,7 +434,8 @@ app.post("/api/analysis/test", async (req, res) => {
 app.post("/api/weread/proxy", async (req, res) => {
   const { targetUrl, skillUrl, apiKey, api_name, skill_version, ...otherParams } = req.body;
 
-  if (!apiKey) {
+  const resolvedApiKey = apiKey || process.env.WEREAD_API_KEY;
+  if (!resolvedApiKey) {
     return res.status(400).json({ errcode: -1, errmsg: "API Key (Bearer Token) is required" });
   }
 
@@ -453,7 +454,7 @@ app.post("/api/weread/proxy", async (req, res) => {
     const response = await fetch(gatewayUrl, {
       method: "POST",
       headers: {
-        "Authorization": `Bearer ${apiKey}`,
+        "Authorization": `Bearer ${resolvedApiKey}`,
         "Content-Type": "application/json"
       },
       body: JSON.stringify(requestBody),
