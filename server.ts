@@ -13,11 +13,19 @@ import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { openDatabase } from "./server/db.ts";
+import { registerWeReadSyncRoutes } from "./server/syncRoutes.ts";
+import { startRefreshScheduler } from "./server/sync/scheduler.ts";
 
 // Node may prefer IPv6; WeRead gateway is reliably reachable over IPv4 on many networks.
 dns.setDefaultResultOrder("ipv4first");
 
 dotenv.config();
+
+const WEREAD_SERVER_SYNC_ENABLED = process.env.WEREAD_SERVER_SYNC !== "0";
+if (WEREAD_SERVER_SYNC_ENABLED) {
+  openDatabase();
+}
 
 async function requestHttpsIpv4(
   targetUrl: string,
@@ -802,6 +810,12 @@ function generateLocalThematicAnalysis(books: any[], highlights: any[]) {
   }
 
   return { yearlyPersonality, thoughtClusters };
+}
+
+if (WEREAD_SERVER_SYNC_ENABLED) {
+  registerWeReadSyncRoutes(app);
+  startRefreshScheduler();
+  console.log("[weread] Server-side SQLite sync enabled (POST /api/weread/snapshot, /sync)");
 }
 
 // 3. Vite Server / Production Build Handles

@@ -6,7 +6,20 @@
 import { useEffect, useRef, useState } from "react";
 import { Compass, BookOpen, Quote, RefreshCw, AlertCircle, ChevronLeft, ChevronRight, FileText, FolderSync, PlusCircle, Trash2, BrainCircuit } from "lucide-react";
 import { PreferCategory, WeReadNotebook, WeReadHighlight, WeReadOverallStats } from "./types";
-import { fetchNotebooks, fetchOverallStats, fetchBookNotes, fetchAiAnalysis, getStoredAnalysisApiConfig, getStoredApiKey, AnalysisApiConfig } from "./api";
+import {
+  fetchNotebooks,
+  fetchOverallStats,
+  fetchBookNotes,
+  fetchAiAnalysis,
+  getStoredAnalysisApiConfig,
+  getStoredApiKey,
+  AnalysisApiConfig,
+  SERVER_SYNC_ENABLED,
+  fetchSnapshot,
+  triggerSync,
+  pollSyncUntilDone
+} from "./api";
+import { mapServerPhaseToOverlay } from "./components/IndexingOverlay";
 import InfiniteCanvas from "./components/InfiniteCanvas";
 import SettingsPanel from "./components/SettingsPanel";
 import AnalysisSettingsPanel from "./components/AnalysisSettingsPanel";
@@ -421,7 +434,189 @@ export default function App() {
     }
   };
 
+  const shuffleHighlights = <T,>(arr: T[]): T[] => {
+    const a = [...arr];
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  };
+
+  const loadDataWeReadServerSync = async (options: { force?: boolean } = {}) => {
+    setLoading(true);
+    setError(null);
+    setIndexingProgress(null);
+
+    try {
+      const snapshot = await fetchSnapshot();
+      const highlights = shuffleHighlights(
+        (snapshot.highlights || []).map((h) => ({
+          ...h,
+          bookName: h.bookName || "",
+          bookAuthor: h.bookAuthor || "",
+          bookCover: h.bookCover || ""
+        })) as HighlightWithBook[]
+      );
+      const snapshotData: CachedModeData = {
+        notebooks: snapshot.notebooks || [],
+        stats: snapshot.stats as WeReadOverallStats | null,
+        highlights,
+        yearlyPersonality: [],
+        thoughtClusters: [],
+        isAiGenerated: false,
+        analysisConnected: false,
+        analysisModel: getStoredAnalysisApiConfig().model || "本地语义分析",
+        ...(readStoredAnalysis("weread", snapshot.notebooks || [], highlights) || {})
+      };
+      saveCachedData("weread", snapshotData);
+      applyCachedData(snapshotData);
+      setLoading(false);
+
+      const syncStart = await triggerSync(Boolean(options.force));
+      const syncRunId = syncStart.syncRunId;
+
+      try {
+        sessionStorage.setItem("weread_active_sync_run_id", String(syncRunId));
+        const bc = typeof BroadcastChannel !== "undefined" ? new BroadcastChannel("weread_sync") : null;
+        bc?.postMessage({ type: "syncRunId", syncRunId });
+        bc?.close();
+      } catch { /* ignore */ }
+
+      const finalStatus = await pollSyncUntilDone(syncRunId, (p) => {
+        if (p.status === "done") {
+          setIndexingProgress(null);
+          return;
+        }
+        if (p.status === "error") {
+          setIndexingProgress(null);
+          setError(p.error || "后台同步失败");
+          return;
+        }
+        setIndexingProgress({
+          phase: mapServerPhaseToOverlay(p.phase),
+          completed: p.booksDone,
+          total: p.booksTotal,
+          currentBookTitle: p.currentBookTitle,
+          backgroundSync: true
+        });
+      });
+
+      if (finalStatus.status === "done") {
+        const fresh = await fetchSnapshot();
+        const freshHighlights = shuffleHighlights(
+          (fresh.highlights || []).map((h) => ({
+            ...h,
+            bookName: h.bookName || "",
+            bookAuthor: h.bookAuthor || "",
+            bookCover: h.bookCover || ""
+          })) as HighlightWithBook[]
+        );
+        const refreshed: CachedModeData = {
+          ...snapshotData,
+          notebooks: fresh.notebooks || [],
+          stats: fresh.stats as WeReadOverallStats | null,
+          highlights: freshHighlights,
+          ...(readStoredAnalysis("weread", fresh.notebooks || [], freshHighlights) || {})
+        };
+        saveCachedData("weread", refreshed);
+        applyCachedData(refreshed);
+      }
+    } catch (err: unknown) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (message.includes("404") || message.includes("disabled")) {
+        await loadDataLegacyWeRead(options);
+        return;
+      }
+      throw err;
+    } finally {
+      setIndexingProgress(null);
+    }
+  };
+
+  const loadDataLegacyWeRead = async (options: { force?: boolean } = {}) => {
+      setIndexingProgress({
+        phase: "catalog",
+        completed: 0,
+        total: 0
+      });
+
+      const [notebooksRes, statsRes] = await Promise.all([
+        fetchNotebooks(),
+        fetchOverallStats()
+      ]);
+
+      const books = notebooksRes.books;
+      const notesCompletedRef = { current: 0 };
+
+      setIndexingProgress({
+        phase: "notes",
+        completed: 0,
+        total: books.length
+      });
+
+      const notesByBook = await mapWithConcurrency(books, 2, async (bookItem) => {
+        setIndexingProgress({
+          phase: "notes",
+          completed: notesCompletedRef.current,
+          total: books.length,
+          currentBookTitle: bookItem.book.title
+        });
+
+        try {
+          const notesRes = await fetchBookNotes(bookItem.bookId);
+          const mapped = (notesRes.updated || []).map((h) => ({
+            ...h,
+            bookName: bookItem.book.title,
+            bookAuthor: bookItem.book.author,
+            bookCover: bookItem.book.cover
+          }));
+          notesCompletedRef.current += 1;
+          setIndexingProgress({
+            phase: "notes",
+            completed: notesCompletedRef.current,
+            total: books.length,
+            currentBookTitle: bookItem.book.title
+          });
+          return mapped;
+        } catch (e) {
+          console.warn(`Failed downloading notes for ${bookItem.bookId}`, e);
+          notesCompletedRef.current += 1;
+          setIndexingProgress({
+            phase: "notes",
+            completed: notesCompletedRef.current,
+            total: books.length,
+            currentBookTitle: bookItem.book.title
+          });
+          return [];
+        }
+      });
+
+      setIndexingProgress({
+        phase: "finishing",
+        completed: books.length,
+        total: books.length
+      });
+
+      const resolvedHighlights = notesByBook.flat();
+      const shuffled = shuffleHighlights(resolvedHighlights);
+      const snapshot: CachedModeData = {
+        notebooks: notebooksRes.books,
+        stats: statsRes,
+        highlights: shuffled,
+        yearlyPersonality: [],
+        thoughtClusters: [],
+        isAiGenerated: false,
+        analysisConnected: false,
+        analysisModel: getStoredAnalysisApiConfig().model || "本地语义分析",
+        ...(readStoredAnalysis("weread", notebooksRes.books, shuffled) || {})
+      };
+      saveCachedData("weread", snapshot);
+      applyCachedData(snapshot);
+  };
+
   const loadData = async (targetMode: DataMode = mode, options: { force?: boolean } = {}) => {
+    let usedServerSync = false;
     try {
       if (!options.force && dataCacheRef.current[targetMode]) {
         applyCachedData(dataCacheRef.current[targetMode]!);
@@ -433,6 +628,12 @@ export default function App() {
       setLoading(true);
       setError(null);
       setIndexingProgress(null);
+
+      if (targetMode === "weread" && SERVER_SYNC_ENABLED) {
+        usedServerSync = true;
+        await loadDataWeReadServerSync(options);
+        return;
+      }
 
       if (targetMode === "obsidian") {
         const storedStr = localStorage.getItem("weread_obsidian_payload");
@@ -499,98 +700,16 @@ export default function App() {
         return;
       }
 
-      setIndexingProgress({
-        phase: "catalog",
-        completed: 0,
-        total: 0
-      });
-
-      // 1. Fetch bookshelf notebooks and general stats
-      const [notebooksRes, statsRes] = await Promise.all([
-        fetchNotebooks(),
-        fetchOverallStats()
-      ]);
-
-      const books = notebooksRes.books;
-      const notesCompletedRef = { current: 0 };
-
-      setIndexingProgress({
-        phase: "notes",
-        completed: 0,
-        total: books.length
-      });
-
-      // 2. Fetch notes for every synced book in small batches so large libraries can complete.
-      const notesByBook = await mapWithConcurrency(books, 2, async (bookItem) => {
-        setIndexingProgress({
-          phase: "notes",
-          completed: notesCompletedRef.current,
-          total: books.length,
-          currentBookTitle: bookItem.book.title
-        });
-
-        try {
-          const notesRes = await fetchBookNotes(bookItem.bookId);
-          const mapped = (notesRes.updated || []).map((h) => ({
-            ...h,
-            bookName: bookItem.book.title,
-            bookAuthor: bookItem.book.author,
-            bookCover: bookItem.book.cover
-          }));
-          notesCompletedRef.current += 1;
-          setIndexingProgress({
-            phase: "notes",
-            completed: notesCompletedRef.current,
-            total: books.length,
-            currentBookTitle: bookItem.book.title
-          });
-          return mapped;
-        } catch (e) {
-          console.warn(`Failed downloading notes for ${bookItem.bookId}`, e);
-          notesCompletedRef.current += 1;
-          setIndexingProgress({
-            phase: "notes",
-            completed: notesCompletedRef.current,
-            total: books.length,
-            currentBookTitle: bookItem.book.title
-          });
-          return [];
-        }
-      });
-
-      setIndexingProgress({
-        phase: "finishing",
-        completed: books.length,
-        total: books.length
-      });
-
-      const resolvedHighlights = notesByBook.flat();
-      
-      // Shuffle highlights randomly instead of sorting by book/time
-      for (let i = resolvedHighlights.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [resolvedHighlights[i], resolvedHighlights[j]] = [resolvedHighlights[j], resolvedHighlights[i]];
-      }
-      const snapshot: CachedModeData = {
-        notebooks: notebooksRes.books,
-        stats: statsRes,
-        highlights: resolvedHighlights,
-        yearlyPersonality: [],
-        thoughtClusters: [],
-        isAiGenerated: false,
-        analysisConnected: false,
-        analysisModel: getStoredAnalysisApiConfig().model || "本地语义分析",
-        ...(readStoredAnalysis("weread", notebooksRes.books, resolvedHighlights) || {})
-      };
-      saveCachedData("weread", snapshot);
-      applyCachedData(snapshot);
+      await loadDataLegacyWeRead(options);
       setLoading(false);
 
     } catch (err: any) {
       console.error(err);
       setError(err?.message || "无法拉取微信读书数据，请检查网关和认证Key配置。");
     } finally {
-      setIndexingProgress(null);
+      if (!usedServerSync) {
+        setIndexingProgress(null);
+      }
       setLoading(false);
     }
   };
@@ -849,27 +968,8 @@ export default function App() {
       {/* Main split work space */}
       <div className="flex-1 flex overflow-hidden relative bg-[#FAF9F6]">
         
-        {loading ? (
-          indexingProgress ? (
-            <IndexingOverlay progress={indexingProgress} />
-          ) : (
-            <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6]/95 z-40 font-sans">
-              <div className="relative">
-                <Compass className="w-12 h-12 text-[#2C2C26]/40 animate-spin" />
-                <div className="absolute inset-0 flex items-center justify-center text-[10px] text-[#2C2C26] font-normal font-serif">
-                  阅
-                </div>
-              </div>
-              <p className="text-sm font-serif text-[#2C2C26]/80 mt-4 tracking-normal">
-                正在解构数据图谱并检索心智线索...
-              </p>
-              <p className="text-[10px] font-sans text-[#2C2C26]/40 mt-1 uppercase tracking-widest font-semibold">
-                Please wait while we chart the contours
-              </p>
-            </div>
-          )
-        ) : error ? (
-          <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6] z-40 text-center p-6_font-sans">
+        {error ? (
+          <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6] z-40 text-center p-6 font-sans">
             <AlertCircle className="w-14 h-14 text-red-600/60 mb-4" />
             <h3 className="font-serif font-normal text-lg text-ink-dark mb-1">
               {shouldShowWeReadOnboardingError ? "需要添加微信读书skill api" : "读书数据获取失败"}
@@ -888,6 +988,24 @@ export default function App() {
             </button>
           </div>
         ) : (
+          <>
+            {loading && !indexingProgress?.backgroundSync && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6]/95 z-40 font-sans">
+                <div className="relative">
+                  <Compass className="w-12 h-12 text-[#2C2C26]/40 animate-spin" />
+                  <div className="absolute inset-0 flex items-center justify-center text-[10px] text-[#2C2C26] font-normal font-serif">
+                    阅
+                  </div>
+                </div>
+                <p className="text-sm font-serif text-[#2C2C26]/80 mt-4 tracking-normal">
+                  正在解构数据图谱并检索心智线索...
+                </p>
+              </div>
+            )}
+            {indexingProgress && (
+              <IndexingOverlay progress={indexingProgress} />
+            )}
+            {(!loading || indexingProgress?.backgroundSync) && (
           <>
             {/* LEFT STAGE: Infinite Canvas featuring three detailed maps */}
             <div className={`flex-1 h-full relative ${tab === "canvas" ? "block" : "hidden sm:block"}`}>
@@ -1047,6 +1165,8 @@ export default function App() {
                 )}
               </div>
             </div>
+          </>
+            )}
           </>
         )}
       </div>

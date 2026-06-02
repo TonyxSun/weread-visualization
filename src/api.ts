@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import { WeReadOverallStats, WeReadNotebook, WeReadBookNotesResponse } from "./types";
+import { WeReadOverallStats, WeReadNotebook, WeReadBookNotesResponse, WeReadHighlight } from "./types";
 import { getNotebookReadingTimestamp } from "./utils/wereadDates";
 
 const LOCAL_STORAGE_KEY_API_KEY = "weread_api_key";
@@ -28,6 +28,105 @@ export const DEFAULT_SKILL_VERSION = "1.0.5";
 export const DEFAULT_SKILL_INSTALL_COMMAND = "npx skills add Tencent/WeChatReading -g";
 export const DEFAULT_ANALYSIS_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/responses";
 export const DEFAULT_ANALYSIS_MODEL = "doubao-seed-2-0-lite-260428";
+
+/** Server SQLite sync enabled unless explicitly WEREAD_SERVER_SYNC=0 */
+export const SERVER_SYNC_ENABLED = import.meta.env.WEREAD_SERVER_SYNC !== "0";
+
+export interface WeReadSnapshotMeta {
+  stale: boolean;
+  partial: boolean;
+  pendingBooks: number;
+  lastSyncAt: number | null;
+  syncRunId: number | null;
+  syncInProgress: boolean;
+}
+
+export interface WeReadSnapshotResponse {
+  notebooks: WeReadNotebook[];
+  stats: WeReadOverallStats | null;
+  highlights: Array<WeReadHighlight & { bookName?: string; bookAuthor?: string; bookCover?: string }>;
+  meta: WeReadSnapshotMeta;
+}
+
+export interface WeReadSyncStartResponse {
+  syncRunId: number;
+  status: string;
+  mode: string;
+  coalesced: boolean;
+}
+
+export interface WeReadSyncStatusResponse {
+  syncRunId: number;
+  status: string;
+  phase: string;
+  booksDone: number;
+  booksTotal: number;
+  currentBookTitle?: string;
+  error?: string;
+}
+
+function wereadServerAuthHeaders(): Record<string, string> {
+  const apiKey = getStoredApiKey();
+  if (!isConcreteSecret(apiKey)) {
+    throw new Error("API Key (Bearer Token) is required");
+  }
+  return {
+    Authorization: `Bearer ${stripShellValue(apiKey)}`,
+    "X-WeRead-Gateway-Url": getStoredGatewayUrl(),
+    "X-WeRead-Skill-Version": getStoredSkillVersion(),
+    "Content-Type": "application/json"
+  };
+}
+
+export async function fetchSnapshot(): Promise<WeReadSnapshotResponse> {
+  const response = await fetch("/api/weread/snapshot", {
+    method: "POST",
+    headers: wereadServerAuthHeaders()
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(result?.errmsg || `Snapshot failed: ${response.status}`);
+  }
+  return result as WeReadSnapshotResponse;
+}
+
+export async function triggerSync(force = false): Promise<WeReadSyncStartResponse> {
+  const response = await fetch("/api/weread/sync", {
+    method: "POST",
+    headers: wereadServerAuthHeaders(),
+    body: JSON.stringify({ force })
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok && response.status !== 202) {
+    throw new Error(result?.errmsg || `Sync failed: ${response.status}`);
+  }
+  return result as WeReadSyncStartResponse;
+}
+
+export async function pollSyncStatus(syncRunId: number): Promise<WeReadSyncStatusResponse> {
+  const headers = wereadServerAuthHeaders();
+  const response = await fetch(`/api/weread/sync/status?syncRunId=${syncRunId}`, { headers });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    throw new Error(result?.errmsg || `Sync status failed: ${response.status}`);
+  }
+  return result as WeReadSyncStatusResponse;
+}
+
+export async function pollSyncUntilDone(
+  syncRunId: number,
+  onProgress: (status: WeReadSyncStatusResponse) => void,
+  intervalMs = 1500
+): Promise<WeReadSyncStatusResponse> {
+  for (;;) {
+    const status = await pollSyncStatus(syncRunId);
+    onProgress(status);
+    if (status.status === "done" || status.status === "error") {
+      return status;
+    }
+    await wait(intervalMs);
+  }
+}
 
 export interface AnalysisApiConfig {
   endpoint: string;
