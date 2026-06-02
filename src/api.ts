@@ -15,7 +15,10 @@ const LOCAL_STORAGE_KEY_ANALYSIS_API_ENDPOINT = "reading_analysis_api_endpoint";
 const LOCAL_STORAGE_KEY_ANALYSIS_API_KEY = "reading_analysis_api_key";
 const LOCAL_STORAGE_KEY_ANALYSIS_MODEL = "reading_analysis_model";
 const WEREAD_PROXY_TIMEOUT_MS = 180000;
-const WEREAD_PROXY_RETRIES = 2;
+const WEREAD_PROXY_RETRIES = 6;
+const WEREAD_MAX_CONCURRENT = 2;
+const WEREAD_MIN_REQUEST_GAP_MS = 400;
+const WEREAD_RATE_LIMIT_BASE_MS = 2500;
 const NOTEBOOK_FETCH_MIN_COUNT = 100;
 const NOTEBOOK_FETCH_MAX_COUNT = 5000;
 
@@ -41,6 +44,34 @@ const MBTI_TYPES = new Set([
 
 function wait(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isRateLimitMessage(message: string): boolean {
+  return /频率超限|请求频率|rate limit|too many requests/i.test(message);
+}
+
+let wereadInflight = 0;
+const wereadWaiters: Array<() => void> = [];
+
+async function acquireWeReadSlot(): Promise<void> {
+  if (wereadInflight < WEREAD_MAX_CONCURRENT) {
+    wereadInflight += 1;
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    wereadWaiters.push(resolve);
+  });
+  wereadInflight += 1;
+}
+
+function releaseWeReadSlot(): void {
+  wereadInflight = Math.max(0, wereadInflight - 1);
+  const next = wereadWaiters.shift();
+  if (next) next();
+}
+
+async function throttleWeReadRequest(): Promise<void> {
+  await wait(WEREAD_MIN_REQUEST_GAP_MS);
 }
 
 function stripShellValue(value: string): string {
@@ -301,47 +332,57 @@ async function callWeReadProxy(apiName: string, params: any = {}): Promise<any> 
   }
 
   let lastError: Error | null = null;
-  for (let attempt = 0; attempt <= WEREAD_PROXY_RETRIES; attempt += 1) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), WEREAD_PROXY_TIMEOUT_MS);
+  await acquireWeReadSlot();
+  try {
+    for (let attempt = 0; attempt <= WEREAD_PROXY_RETRIES; attempt += 1) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), WEREAD_PROXY_TIMEOUT_MS);
 
-    try {
-      const response = await fetch("/api/weread/proxy", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          targetUrl: gatewayUrl,
-          apiKey: apiKey,
-          api_name: apiName,
-          skill_version: skillVersion,
-          ...params
-        }),
-        signal: controller.signal
-      });
+      try {
+        const response = await fetch("/api/weread/proxy", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            targetUrl: gatewayUrl,
+            apiKey: apiKey,
+            api_name: apiName,
+            skill_version: skillVersion,
+            ...params
+          }),
+          signal: controller.signal
+        });
 
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        throw new Error(errData?.errmsg || `Failed: Code ${response.status}`);
+        const result = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const message = result?.errmsg || `Failed: Code ${response.status}`;
+          throw new Error(message);
+        }
+
+        if (result.errcode && result.errcode !== 0) {
+          throw new Error(result.errmsg || `WeRead Error [${result.errcode}]`);
+        }
+
+        return result;
+      } catch (error: any) {
+        const message = error?.name === "AbortError"
+          ? `微信读书网关请求超过 ${Math.round(WEREAD_PROXY_TIMEOUT_MS / 1000)} 秒未返回`
+          : error?.message || String(error);
+        lastError = new Error(message);
+        if (attempt < WEREAD_PROXY_RETRIES) {
+          const delay = isRateLimitMessage(message)
+            ? WEREAD_RATE_LIMIT_BASE_MS * (attempt + 1)
+            : (attempt + 1) * 800;
+          await wait(delay);
+        }
+      } finally {
+        clearTimeout(timeout);
       }
-
-      const result = await response.json();
-      if (result.errcode && result.errcode !== 0) {
-        throw new Error(result.errmsg || `WeRead Error [${result.errcode}]`);
-      }
-
-      return result;
-    } catch (error: any) {
-      lastError = new Error(error?.name === "AbortError"
-        ? `微信读书网关请求超过 ${Math.round(WEREAD_PROXY_TIMEOUT_MS / 1000)} 秒未返回`
-        : error?.message || String(error));
-      if (attempt < WEREAD_PROXY_RETRIES) {
-        await wait((attempt + 1) * 800);
-      }
-    } finally {
-      clearTimeout(timeout);
     }
+  } finally {
+    releaseWeReadSlot();
+    await throttleWeReadRequest();
   }
 
   throw lastError || new Error("微信读书网关请求失败");
@@ -429,7 +470,10 @@ export async function fetchBookNotes(bookId: string): Promise<WeReadBookNotesRes
     const data = await callWeReadProxy("/book/bookmarklist", { bookId });
     return data;
   } catch (error) {
-    console.error(`fetchBookNotes for ${bookId} failed.`, error);
+    const message = error instanceof Error ? error.message : String(error);
+    if (!isRateLimitMessage(message)) {
+      console.warn(`fetchBookNotes for ${bookId} failed.`, error);
+    }
     return {
       synckey: 0,
       updated: [],

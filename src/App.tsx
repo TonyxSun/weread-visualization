@@ -503,7 +503,7 @@ export default function App() {
       ]);
 
       // 2. Fetch notes for every synced book in small batches so large libraries can complete.
-      const notesByBook = await mapWithConcurrency(notebooksRes.books, 6, async (bookItem) => {
+      const notesByBook = await mapWithConcurrency(notebooksRes.books, 2, async (bookItem) => {
         try {
           const notesRes = await fetchBookNotes(bookItem.bookId);
           return (notesRes.updated || []).map((h) => ({

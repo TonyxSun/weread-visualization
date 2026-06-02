@@ -3,6 +3,10 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import dns from "dns";
+import dnsPromises from "dns/promises";
+import https from "https";
+import type http from "http";
 import express from "express";
 import path from "path";
 import fs from "fs";
@@ -10,7 +14,92 @@ import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 
+// Node may prefer IPv6; WeRead gateway is reliably reachable over IPv4 on many networks.
+dns.setDefaultResultOrder("ipv4first");
+
 dotenv.config();
+
+async function requestHttpsIpv4(
+  targetUrl: string,
+  options: {
+    method?: string;
+    headers?: Record<string, string>;
+    body?: string;
+    signal?: AbortSignal;
+  } = {}
+): Promise<{ status: number; headers: http.IncomingHttpHeaders; body: Buffer }> {
+  const url = new URL(targetUrl);
+  const { address } = await dnsPromises.lookup(url.hostname, { family: 4 });
+  const payload = options.body ?? "";
+  const method = options.method ?? (payload ? "POST" : "GET");
+  const reqHeaders: Record<string, string> = {
+    ...options.headers,
+    Host: url.hostname
+  };
+  if (payload) {
+    reqHeaders["Content-Length"] = String(Buffer.byteLength(payload));
+  }
+
+  return new Promise((resolve, reject) => {
+    const req = https.request(
+      {
+        host: address,
+        servername: url.hostname,
+        port: url.port ? Number(url.port) : 443,
+        path: `${url.pathname}${url.search}`,
+        method,
+        headers: reqHeaders
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on("data", (chunk) => { chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)); });
+        res.on("end", () => {
+          resolve({
+            status: res.statusCode ?? 500,
+            headers: res.headers,
+            body: Buffer.concat(chunks)
+          });
+        });
+      }
+    );
+
+    const onAbort = () => {
+      req.destroy(Object.assign(new Error("The operation was aborted"), { name: "AbortError" }));
+    };
+    if (options.signal) {
+      if (options.signal.aborted) onAbort();
+      else options.signal.addEventListener("abort", onAbort, { once: true });
+    }
+
+    req.on("error", reject);
+    if (payload) req.write(payload);
+    req.end();
+  });
+}
+
+async function postWeReadGateway(
+  gatewayUrl: string,
+  headers: Record<string, string>,
+  body: Record<string, unknown>,
+  signal?: AbortSignal
+): Promise<{ status: number; data: unknown }> {
+  const payload = JSON.stringify(body);
+  const response = await requestHttpsIpv4(gatewayUrl, {
+    method: "POST",
+    headers: {
+      ...headers,
+      "Content-Type": "application/json"
+    },
+    body: payload,
+    signal
+  });
+
+  try {
+    return { status: response.status, data: JSON.parse(response.body.toString("utf8") || "{}") };
+  } catch {
+    throw new Error("Invalid JSON from WeRead gateway");
+  }
+}
 
 // Lazy-initialized Gemini Client
 let aiClient: GoogleGenAI | null = null;
@@ -451,18 +540,17 @@ app.post("/api/weread/proxy", async (req, res) => {
   const timeout = setTimeout(() => controller.abort(), WEREAD_GATEWAY_TIMEOUT_MS);
 
   try {
-    const response = await fetch(gatewayUrl, {
-      method: "POST",
-      headers: {
+    const response = await postWeReadGateway(
+      gatewayUrl,
+      {
         "Authorization": `Bearer ${resolvedApiKey}`,
         "Content-Type": "application/json"
       },
-      body: JSON.stringify(requestBody),
-      signal: controller.signal
-    });
+      requestBody,
+      controller.signal
+    );
 
-    const data = await response.json();
-    res.status(response.status).json(data);
+    res.status(response.status).json(response.data);
   } catch (error: any) {
     console.error("WeRead API Gateway Proxy Error:", error);
     const timeoutMessage = error?.name === "AbortError"
@@ -482,24 +570,24 @@ app.get("/api/weread/proxy-cover", async (req, res) => {
   }
 
   try {
-    const response = await fetch(url, {
+    const response = await requestHttpsIpv4(url, {
       headers: {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Referer": "https://weread.qq.com/"
       }
     });
-    if (!response.ok) {
+    if (response.status < 200 || response.status >= 300) {
       throw new Error(`Failed to fetch cover. Status: ${response.status}`);
     }
 
-    const contentType = response.headers.get("content-type") || "image/jpeg";
-    const arrayBuffer = await response.arrayBuffer();
-    const buffer = Buffer.from(arrayBuffer);
+    const contentType = (Array.isArray(response.headers["content-type"])
+      ? response.headers["content-type"][0]
+      : response.headers["content-type"]) || "image/jpeg";
 
     res.setHeader("Content-Type", contentType);
     res.setHeader("Access-Control-Allow-Origin", "*");
     res.setHeader("Cache-Control", "public, max-age=86400"); // Cache for 24 hours
-    res.send(buffer);
+    res.send(response.body);
   } catch (error: any) {
     console.error("WeRead Cover Proxy Error:", error);
     res.status(500).send("Failed to load cover image");
