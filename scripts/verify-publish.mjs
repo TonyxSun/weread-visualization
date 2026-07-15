@@ -46,10 +46,15 @@ const appSrc = fs.readFileSync(appPath, "utf8");
 const bannedImports = [
   /from\s+["'].*SettingsPanel["']/,
   /from\s+["'].*AnalysisSettingsPanel["']/,
+  /from\s+["'].*ObsidianImporter["']/,
   /<SettingsPanel\b/,
   /<AnalysisSettingsPanel\b/,
+  /<ObsidianImporter\b/,
   /id=["']settings-panel["']/,
-  /id=["']analysis-settings-panel["']/
+  /id=["']analysis-settings-panel["']/,
+  /id=["']obsidian-importer-panel["']/,
+  /Obsidian 导入/,
+  /handleSwitchMode/
 ];
 for (const re of bannedImports) {
   assert(!re.test(appSrc), `App.tsx must not match ${re}`);
@@ -57,8 +62,10 @@ for (const re of bannedImports) {
 
 const settingsExists = fs.existsSync(path.join(root, "src/components/SettingsPanel.tsx"));
 const analysisExists = fs.existsSync(path.join(root, "src/components/AnalysisSettingsPanel.tsx"));
+const obsidianExists = fs.existsSync(path.join(root, "src/components/ObsidianImporter.tsx"));
 assert(!settingsExists, "SettingsPanel.tsx deleted (not shipped)");
 assert(!analysisExists, "AnalysisSettingsPanel.tsx deleted (not shipped)");
+assert(!obsidianExists, "ObsidianImporter.tsx deleted (not shipped)");
 
 // Visitor-facing secret UI strings must not appear in shell components
 const shellFiles = [

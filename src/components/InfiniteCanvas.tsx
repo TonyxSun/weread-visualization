@@ -127,8 +127,7 @@ export default function InfiniteCanvas({ children, onBlankClick }: InfiniteCanva
       target.closest("input") ||
       target.closest("textarea") ||
       target.closest("select") ||
-      target.closest("a") ||
-      target.closest("#obsidian-importer-panel")
+      target.closest("a")
     ) {
       movedDuringDrag.current = false;
       return;

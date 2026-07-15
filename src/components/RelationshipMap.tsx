@@ -403,7 +403,7 @@ export default function RelationshipMap({ notebooks, highlights, onReanalyze, is
             <g>
               <rect x={chartLeft + 200} y={CHART_TOP + 110} width={900} height={80} rx={8} fill="rgba(255,255,255,0.4)" stroke="rgba(44,44,38,0.15)" strokeDasharray="4 4" />
               <text x={chartLeft + 650} y={CHART_TOP + 140} textAnchor="middle" className="font-serif" fontSize="20" fill="#2C2C26">等待阅读数据进入地图</text>
-              <text x={chartLeft + 650} y={CHART_TOP + 165} textAnchor="middle" className="font-sans" fontSize="12" fill="rgba(44,44,38,0.6)">导入 Obsidian 或同步微信读书后，这里会自动生成年份与分类交叉的阅读轨迹。</text>
+              <text x={chartLeft + 650} y={CHART_TOP + 165} textAnchor="middle" className="font-sans" fontSize="12" fill="rgba(44,44,38,0.6)">同步微信读书数据后，这里会自动生成年份与分类交叉的阅读轨迹。</text>
             </g>
           ) : (
             parsed.map((item) => {
