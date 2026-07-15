@@ -3,11 +3,16 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useMemo, useEffect } from "react";
 import { WeReadHighlight, WeReadNotebook } from "../types";
 import { Download, Heart, Compass, ArrowDown, ArrowUp, Check, Loader2 } from "lucide-react";
 import { toPng } from "html-to-image";
 import BookCover from "./BookCover";
+import {
+  filterHighlightsForCardStyle,
+  normalizeExcerpt,
+  type CardStyleId
+} from "../utils/cardExcerpts";
 import styleOneBg from "../../assets/风格一.png";
 import styleTwoBg from "../../assets/风格二.png";
 import styleThreeBg from "../../assets/风格三.png";
@@ -19,7 +24,7 @@ interface CardSwiperProps {
   highlights: Array<WeReadHighlight & { bookName: string; bookAuthor: string; bookCover: string }>;
 }
 
-type CardStyle = "terra" | "portable" | "receipt" | "cleanse" | "journey";
+type CardStyle = CardStyleId;
 
 const cardStyles: Array<{
   id: CardStyle;
@@ -45,14 +50,30 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
   const doubleTapRef = useRef<number | null>(null);
   const cardRef = useRef<HTMLDivElement>(null);
 
-  const activeHighlight = highlights[currentIndex];
+  // Only cycle excerpts that fit the active card layout (not the full highlight dump).
+  const cardHighlights = useMemo(
+    () => filterHighlightsForCardStyle(highlights, cardStyle),
+    [highlights, cardStyle]
+  );
+
+  useEffect(() => {
+    setCurrentIndex((prev) => {
+      if (cardHighlights.length === 0) return 0;
+      return Math.min(prev, cardHighlights.length - 1);
+    });
+    setCopyStatus("idle");
+  }, [cardHighlights.length, cardStyle]);
+
+  const activeHighlight = cardHighlights[currentIndex];
+  const skippedCount = Math.max(0, highlights.length - cardHighlights.length);
 
   // Change card helper
   const navigateCard = (direction: "up" | "down") => {
+    if (cardHighlights.length === 0) return;
     if (direction === "up") {
-      setCurrentIndex((prev) => (prev > 0 ? prev - 1 : highlights.length - 1));
+      setCurrentIndex((prev) => (prev > 0 ? prev - 1 : cardHighlights.length - 1));
     } else if (direction === "down") {
-      setCurrentIndex((prev) => (prev < highlights.length - 1 ? prev + 1 : 0));
+      setCurrentIndex((prev) => (prev < cardHighlights.length - 1 ? prev + 1 : 0));
     }
     setCopyStatus("idle");
   };
@@ -136,7 +157,7 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
       
       // Fallback: Simple text clipboard copy
       try {
-        await navigator.clipboard.writeText(`「${activeHighlight.markText}」 —— 来自《${activeHighlight.bookName}》`);
+        await navigator.clipboard.writeText(`「${normalizeExcerpt(activeHighlight.markText)}」 —— 来自《${activeHighlight.bookName}》`);
         setCopyStatus("copied");
       } catch (textFallbackErr) {
         setCopyStatus("failed");
@@ -149,7 +170,7 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
     }, 2500);
   };
 
-  if (!activeHighlight) {
+  if (highlights.length === 0) {
     return (
       <div className="flex flex-col items-center justify-center h-full w-full bg-[#fbf9f4] border border-[#d6cea8] rounded-xl p-6 text-center text-[#9a8d76]">
         <Compass className="w-8 h-8 animate-spin mb-4" />
@@ -158,21 +179,47 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
     );
   }
 
+  if (!activeHighlight) {
+    return (
+      <div className="flex h-full w-full flex-col items-center justify-center gap-3 rounded-xl border border-[#d6cea8] bg-[#fbf9f4] p-6 text-center text-[#9a8d76]">
+        <p className="font-serif text-sm text-[#2C2C26]/75">当前样式没有合适长度的划线</p>
+        <p className="max-w-[220px] text-[11px] leading-relaxed text-[#2C2C26]/50">
+          已从 {highlights.length} 条划线中筛掉过长或过短的摘录。试试切换上方卡片样式，或同步更多金句。
+        </p>
+        <div className="mt-2 flex items-center justify-center gap-2">
+          {cardStyles.map((style) => (
+            <button
+              key={style.id}
+              type="button"
+              onClick={() => changeCardStyle(style.id)}
+              className={`flex h-8 w-8 items-center justify-center rounded-full border text-sm transition-all ${
+                style.id === cardStyle
+                  ? "border-black bg-black text-white"
+                  : "border-[#2C2C26]/12 bg-white text-[#2C2C26]/60 hover:bg-white cursor-pointer"
+              }`}
+              title={style.title}
+            >
+              {cardStyles.findIndex((s) => s.id === style.id) + 1}
+            </button>
+          ))}
+        </div>
+      </div>
+    );
+  }
+
   const recordedDate = new Date(activeHighlight.createTime * 1000).toISOString().split("T")[0];
   const cleanAuthor = activeHighlight.bookAuthor?.replace(/\[.*?\]/, "").trim() || "佚名";
-  const styleFourQuoteClass = activeHighlight.markText.length > 220
-    ? "text-[10px] leading-[1.62]"
-    : activeHighlight.markText.length > 150
-    ? "text-[11px] leading-[1.66]"
-    : activeHighlight.markText.length > 90
+  const quoteText = normalizeExcerpt(activeHighlight.markText);
+  const quoteLen = quoteText.length;
+  const styleFourQuoteClass = quoteLen > 140
+    ? "text-[12px] leading-[1.68]"
+    : quoteLen > 90
     ? "text-[12.5px] leading-[1.72]"
     : "text-[14px] leading-[1.78]";
-  const styleFiveQuoteClass = activeHighlight.markText.length > 220
-    ? "text-[10px] leading-[1.52]"
-    : activeHighlight.markText.length > 150
-    ? "text-[11px] leading-[1.56]"
-    : activeHighlight.markText.length > 90
-    ? "text-[12px] leading-[1.62]"
+  const styleFiveQuoteClass = quoteLen > 140
+    ? "text-[12px] leading-[1.6]"
+    : quoteLen > 90
+    ? "text-[12.5px] leading-[1.64]"
     : "text-[13px] leading-[1.68]";
 
   const renderStyledCard = () => {
@@ -190,8 +237,8 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
               draggable={false}
             />
             <div className="absolute left-[35%] top-[35%] w-[39%] text-left">
-              <p className="max-h-[148px] overflow-y-auto scrollbar-none text-[12.5px] font-light leading-[1.55] tracking-[0.08em] text-[#11110f]/85">
-                “{activeHighlight.markText}”
+              <p className="max-h-[148px] overflow-hidden text-[12.5px] font-light leading-[1.55] tracking-[0.08em] text-[#11110f]/85">
+                “{quoteText}”
               </p>
               <div className="mt-6 space-y-1 text-[9.5px] font-light leading-[1.4] tracking-[0.06em] text-[#5e5d58]/70">
                 <p className="line-clamp-2">{activeHighlight.bookName}</p>
@@ -226,8 +273,8 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
             </h3>
             <div className="mt-7 h-px w-[86%] bg-[#1c1614]/70"></div>
 
-            <div className="mt-12 min-h-0 flex-1 overflow-y-auto scrollbar-none text-[10px] font-normal leading-[1.6] tracking-[0.08em]">
-              <p>{activeHighlight.markText}</p>
+            <div className="mt-12 min-h-0 flex-1 overflow-hidden text-[10px] font-normal leading-[1.6] tracking-[0.08em]">
+              <p>{quoteText}</p>
             </div>
 
             <div className="mt-9 h-px w-[86%] bg-[#1c1614]/70"></div>
@@ -271,8 +318,8 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
               className="absolute left-1/2 top-[50%] w-4/5 -translate-x-1/2 text-center font-light tracking-[0.03em] text-white drop-shadow-[0_1px_8px_rgba(0,0,0,0.35)]"
               style={{ fontFamily: "'Songti SC', 'STSong', SimSun, serif" }}
             >
-              <p className={`mx-auto max-h-[220px] w-full overflow-y-auto scrollbar-none ${styleFourQuoteClass}`}>
-                {activeHighlight.markText}
+              <p className={`mx-auto max-h-[220px] w-full overflow-hidden ${styleFourQuoteClass}`}>
+                {quoteText}
               </p>
               <div className="relative mx-auto mt-12 h-7 w-[72%]">
                 <div className="absolute left-[8%] top-1 h-[1.5px] w-[80%] -rotate-3 bg-white/82"></div>
@@ -303,8 +350,8 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
           </div>
 
           <div className="absolute right-[8%] top-[30%] w-[52%] text-left">
-            <p className={`max-h-[220px] overflow-y-auto scrollbar-none font-serif text-[#25221b]/80 ${styleFiveQuoteClass}`}>
-              {activeHighlight.markText}
+            <p className={`max-h-[220px] overflow-hidden font-serif text-[#25221b]/80 ${styleFiveQuoteClass}`}>
+              {quoteText}
             </p>
             <p className="mt-7 font-mono text-[7.5px] uppercase tracking-[0.18em] text-[#25221b]/45">
               {recordedDate}
@@ -339,8 +386,8 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
             </div>
 
             <div className="flex min-h-0 flex-1 items-center justify-center py-8">
-              <p className="max-h-full overflow-y-auto scrollbar-none text-[15px] leading-[1.82] text-[#211b16]/80">
-                {activeHighlight.markText}
+              <p className="max-h-full overflow-hidden text-[15px] leading-[1.82] text-[#211b16]/80">
+                {quoteText}
               </p>
             </div>
 
@@ -397,8 +444,18 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
           <span className="text-[10px] font-sans tracking-widest text-[#2C2C26]/50 uppercase">
             划线记忆 · 刷卡
           </span>
-          <span className="text-[10px] font-mono text-[#2C2C26]/50">
-            {currentIndex + 1} / {highlights.length}
+          <span
+            className="text-[10px] font-mono text-[#2C2C26]/50"
+            title={
+              skippedCount > 0
+                ? `已隐藏 ${skippedCount} 条过长/过短划线（当前样式一屏可排版）`
+                : "当前样式下的划线卡片"
+            }
+          >
+            {currentIndex + 1} / {cardHighlights.length}
+            {skippedCount > 0 ? (
+              <span className="ml-1 text-[#2C2C26]/35">· 适长 {cardHighlights.length}/{highlights.length}</span>
+            ) : null}
           </span>
         </div>
 
