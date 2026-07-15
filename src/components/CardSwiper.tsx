@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useState, useRef, useMemo, useEffect } from "react";
+import React, { useState, useRef, useMemo, useEffect, useLayoutEffect, useCallback } from "react";
 import { WeReadHighlight, WeReadNotebook } from "../types";
 import { Download, Heart, Compass, ArrowDown, ArrowUp, Check, Loader2 } from "lucide-react";
 import { toPng } from "html-to-image";
@@ -11,6 +11,8 @@ import BookCover from "./BookCover";
 import {
   filterHighlightsForCardStyle,
   normalizeExcerpt,
+  highlightCardKey,
+  elementShowsFullText,
   type CardStyleId
 } from "../utils/cardExcerpts";
 import styleOneBg from "../../assets/风格一.png";
@@ -25,6 +27,7 @@ interface CardSwiperProps {
 }
 
 type CardStyle = CardStyleId;
+type CardHighlight = CardSwiperProps["highlights"][number];
 
 const cardStyles: Array<{
   id: CardStyle;
@@ -47,27 +50,73 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
   const [cardStyle, setCardStyle] = useState<CardStyle>("terra");
   const [floatingHearts, setFloatingHearts] = useState<Array<{ id: number; x: number; y: number }>>([]);
   const [copyStatus, setCopyStatus] = useState<"idle" | "rendering" | "copied" | "downloaded" | "failed">("idle");
+  /** Keys that still overflowed after geometry pre-filter (measured in the real DOM). */
+  const [overflowRejected, setOverflowRejected] = useState<Set<string>>(() => new Set());
   const doubleTapRef = useRef<number | null>(null);
   const cardRef = useRef<HTMLDivElement>(null);
+  const quoteRef = useRef<HTMLParagraphElement>(null);
 
-  // Only cycle excerpts that fit the active card layout (not the full highlight dump).
-  const cardHighlights = useMemo(
-    () => filterHighlightsForCardStyle(highlights, cardStyle),
-    [highlights, cardStyle]
-  );
+  // Geometry pre-filter, then drop any id the live layout still clips.
+  const cardHighlights = useMemo(() => {
+    const pre = filterHighlightsForCardStyle(highlights, cardStyle);
+    if (overflowRejected.size === 0) return pre;
+    return pre.filter((h) => !overflowRejected.has(highlightCardKey(h)));
+  }, [highlights, cardStyle, overflowRejected]);
+
+  useEffect(() => {
+    // Style change: only keep rejections for the active style's next measure pass.
+    setOverflowRejected(new Set());
+    setCurrentIndex(0);
+    setCopyStatus("idle");
+  }, [cardStyle]);
 
   useEffect(() => {
     setCurrentIndex((prev) => {
       if (cardHighlights.length === 0) return 0;
       return Math.min(prev, cardHighlights.length - 1);
     });
-    setCopyStatus("idle");
-  }, [cardHighlights.length, cardStyle]);
+  }, [cardHighlights.length]);
 
-  const activeHighlight = cardHighlights[currentIndex];
+  const activeHighlight = cardHighlights[currentIndex] as CardHighlight | undefined;
   const skippedCount = Math.max(0, highlights.length - cardHighlights.length);
 
-  // Change card helper
+  const rejectActiveIfClipped = useCallback(() => {
+    const el = quoteRef.current;
+    const active = activeHighlight;
+    if (!el || !active) return false;
+    const shown = elementShowsFullText(el, 2);
+    // Layout not ready yet — retry on next frame
+    if (shown === null) return false;
+    if (shown === false) {
+      const key = highlightCardKey(active);
+      setOverflowRejected((prev) => {
+        if (prev.has(key)) return prev;
+        const next = new Set(prev);
+        next.add(key);
+        return next;
+      });
+    }
+    return true;
+  }, [activeHighlight]);
+
+  useLayoutEffect(() => {
+    let cancelled = false;
+    let tries = 0;
+    const run = () => {
+      if (cancelled) return;
+      const done = rejectActiveIfClipped();
+      // Retry a few frames while flex/percent heights settle
+      if (!done && tries < 8) {
+        tries += 1;
+        requestAnimationFrame(run);
+      }
+    };
+    run();
+    return () => {
+      cancelled = true;
+    };
+  }, [rejectActiveIfClipped, cardStyle, currentIndex, quoteTextKey(activeHighlight)]);
+
   const navigateCard = (direction: "up" | "down") => {
     if (cardHighlights.length === 0) return;
     if (direction === "up") {
@@ -83,23 +132,19 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
     setCopyStatus("idle");
   };
 
-  // Keyboard navigation
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key === "ArrowUp") navigateCard("up");
     else if (e.key === "ArrowDown") navigateCard("down");
   };
 
-  // Click & Double-click mechanism for likes and floating hearts
   const handleCardClick = (e: React.MouseEvent<HTMLDivElement>) => {
     const now = Date.now();
     const DOUBLE_TAP_DELAY = 300;
-    
+
     if (doubleTapRef.current && (now - doubleTapRef.current < DOUBLE_TAP_DELAY)) {
-      // Double tap recognized!
       const rect = e.currentTarget.getBoundingClientRect();
       const x = e.clientX - rect.left;
       const y = e.clientY - rect.top;
-      
       triggerLike(x, y);
       doubleTapRef.current = null;
     } else {
@@ -109,12 +154,10 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
 
   const triggerLike = (x: number, y: number) => {
     if (!activeHighlight) return;
-
-    // Spawn floating heart
     const newHeart = { id: Date.now(), x, y };
-    setFloatingHearts(prev => [...prev, newHeart]);
+    setFloatingHearts((prev) => [...prev, newHeart]);
     setTimeout(() => {
-      setFloatingHearts(prev => prev.filter(h => h.id !== newHeart.id));
+      setFloatingHearts((prev) => prev.filter((h) => h.id !== newHeart.id));
     }, 1000);
   };
 
@@ -124,7 +167,6 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
     setCopyStatus("rendering");
 
     try {
-      // Configure html-to-image to build a high quality capture of the card
       const dataUrl = await toPng(cardRef.current, {
         cacheBust: true,
         backgroundColor: "#ffffff",
@@ -133,7 +175,6 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
           borderRadius: "8px",
         },
         filter: (node) => {
-          // Do not render any action buttons inside the picture if they exist
           if (node instanceof HTMLElement && (node.tagName === "BUTTON" || node.id === "copy-btn-inner")) {
             return false;
           }
@@ -143,28 +184,27 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
 
       if (!dataUrl) throw new Error("渲染图片失败");
 
-      // Save/Download PNG file directly to be solid and reliable
       const link = document.createElement("a");
       link.href = dataUrl;
       link.download = `微信读书-${activeHighlight.bookName.substring(0, 12)}-金句.png`;
       document.body.appendChild(link);
       link.click();
       document.body.removeChild(link);
-      
+
       setCopyStatus("downloaded");
     } catch (error) {
       console.error("生成卡片图片并下载发生错误，采用文本备份复制:", error);
-      
-      // Fallback: Simple text clipboard copy
+
       try {
-        await navigator.clipboard.writeText(`「${normalizeExcerpt(activeHighlight.markText)}」 —— 来自《${activeHighlight.bookName}》`);
+        await navigator.clipboard.writeText(
+          `「${normalizeExcerpt(activeHighlight.markText)}」 —— 来自《${activeHighlight.bookName}》`
+        );
         setCopyStatus("copied");
-      } catch (textFallbackErr) {
+      } catch {
         setCopyStatus("failed");
       }
     }
 
-    // Auto clear status
     setTimeout(() => {
       setCopyStatus("idle");
     }, 2500);
@@ -182,9 +222,9 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
   if (!activeHighlight) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center gap-3 rounded-xl border border-[#d6cea8] bg-[#fbf9f4] p-6 text-center text-[#9a8d76]">
-        <p className="font-serif text-sm text-[#2C2C26]/75">当前样式没有合适长度的划线</p>
-        <p className="max-w-[220px] text-[11px] leading-relaxed text-[#2C2C26]/50">
-          已从 {highlights.length} 条划线中筛掉过长或过短的摘录。试试切换上方卡片样式，或同步更多金句。
+        <p className="font-serif text-sm text-[#2C2C26]/75">当前样式没有可完整显示的划线</p>
+        <p className="max-w-[240px] text-[11px] leading-relaxed text-[#2C2C26]/50">
+          卡片只展示能一屏排完的金句（已从 {highlights.length} 条中筛掉过长摘录）。试试切换上方样式。
         </p>
         <div className="mt-2 flex items-center justify-center gap-2">
           {cardStyles.map((style) => (
@@ -210,19 +250,10 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
   const recordedDate = new Date(activeHighlight.createTime * 1000).toISOString().split("T")[0];
   const cleanAuthor = activeHighlight.bookAuthor?.replace(/\[.*?\]/, "").trim() || "佚名";
   const quoteText = normalizeExcerpt(activeHighlight.markText);
-  const quoteLen = quoteText.length;
-  const styleFourQuoteClass = quoteLen > 140
-    ? "text-[12px] leading-[1.68]"
-    : quoteLen > 90
-    ? "text-[12.5px] leading-[1.72]"
-    : "text-[14px] leading-[1.78]";
-  const styleFiveQuoteClass = quoteLen > 140
-    ? "text-[12px] leading-[1.6]"
-    : quoteLen > 90
-    ? "text-[12.5px] leading-[1.64]"
-    : "text-[13px] leading-[1.68]";
 
   const renderStyledCard = () => {
+    // Quote nodes share data-card-quote + quoteRef for overflow measurement.
+    // overflow-hidden is intentional: if anything still clips, useLayoutEffect rejects it.
     if (cardStyle === "portable") {
       return (
         <div
@@ -237,7 +268,11 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
               draggable={false}
             />
             <div className="absolute left-[35%] top-[35%] w-[39%] text-left">
-              <p className="max-h-[148px] overflow-hidden text-[12.5px] font-light leading-[1.55] tracking-[0.08em] text-[#11110f]/85">
+              <p
+                ref={quoteRef}
+                data-card-quote="true"
+                className="max-h-[148px] overflow-hidden text-[12.5px] font-light leading-[1.55] tracking-[0.08em] text-[#11110f]/85"
+              >
                 “{quoteText}”
               </p>
               <div className="mt-6 space-y-1 text-[9.5px] font-light leading-[1.4] tracking-[0.06em] text-[#5e5d58]/70">
@@ -274,7 +309,9 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
             <div className="mt-7 h-px w-[86%] bg-[#1c1614]/70"></div>
 
             <div className="mt-12 min-h-0 flex-1 overflow-hidden text-[10px] font-normal leading-[1.6] tracking-[0.08em]">
-              <p>{quoteText}</p>
+              <p ref={quoteRef} data-card-quote="true" className="h-full overflow-hidden">
+                {quoteText}
+              </p>
             </div>
 
             <div className="mt-9 h-px w-[86%] bg-[#1c1614]/70"></div>
@@ -318,7 +355,11 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
               className="absolute left-1/2 top-[50%] w-4/5 -translate-x-1/2 text-center font-light tracking-[0.03em] text-white drop-shadow-[0_1px_8px_rgba(0,0,0,0.35)]"
               style={{ fontFamily: "'Songti SC', 'STSong', SimSun, serif" }}
             >
-              <p className={`mx-auto max-h-[220px] w-full overflow-hidden ${styleFourQuoteClass}`}>
+              <p
+                ref={quoteRef}
+                data-card-quote="true"
+                className="mx-auto max-h-[150px] w-full overflow-hidden text-[13px] leading-[1.72]"
+              >
                 {quoteText}
               </p>
               <div className="relative mx-auto mt-12 h-7 w-[72%]">
@@ -350,7 +391,11 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
           </div>
 
           <div className="absolute right-[8%] top-[30%] w-[52%] text-left">
-            <p className={`max-h-[220px] overflow-hidden font-serif text-[#25221b]/80 ${styleFiveQuoteClass}`}>
+            <p
+              ref={quoteRef}
+              data-card-quote="true"
+              className="max-h-[160px] overflow-hidden font-serif text-[13px] leading-[1.64] text-[#25221b]/80"
+            >
               {quoteText}
             </p>
             <p className="mt-7 font-mono text-[7.5px] uppercase tracking-[0.18em] text-[#25221b]/45">
@@ -386,7 +431,11 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
             </div>
 
             <div className="flex min-h-0 flex-1 items-center justify-center py-8">
-              <p className="max-h-full overflow-hidden text-[15px] leading-[1.82] text-[#211b16]/80">
+              <p
+                ref={quoteRef}
+                data-card-quote="true"
+                className="max-h-full overflow-hidden text-[15px] leading-[1.82] text-[#211b16]/80"
+              >
                 {quoteText}
               </p>
             </div>
@@ -402,7 +451,7 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
   };
 
   return (
-    <div 
+    <div
       className="flex h-full w-full flex-col items-center justify-center gap-4 font-sans text-[#2C2C26] select-none outline-hidden"
       onKeyDown={handleKeyDown}
       tabIndex={0}
@@ -442,112 +491,114 @@ export default function CardSwiper({ notebooks, highlights }: CardSwiperProps) {
       <div className="flex min-h-0 w-full max-w-[720px] flex-1 flex-col justify-between rounded-2xl border border-[#2C2C26]/10 bg-white/80 p-5 shadow-xs backdrop-blur-md">
         <div className="flex items-center justify-between border-b border-[#2C2C26]/10 pb-2 mb-3">
           <span className="text-[10px] font-sans tracking-widest text-[#2C2C26]/50 uppercase">
-            划线记忆 · 刷卡
+            划线记忆 · 完整金句
           </span>
           <span
             className="text-[10px] font-mono text-[#2C2C26]/50"
             title={
               skippedCount > 0
-                ? `已隐藏 ${skippedCount} 条过长/过短划线（当前样式一屏可排版）`
-                : "当前样式下的划线卡片"
+                ? `已隐藏 ${skippedCount} 条无法在当前样式一屏完整显示的划线`
+                : "当前样式可完整展示的划线"
             }
           >
             {currentIndex + 1} / {cardHighlights.length}
             {skippedCount > 0 ? (
-              <span className="ml-1 text-[#2C2C26]/35">· 适长 {cardHighlights.length}/{highlights.length}</span>
+              <span className="ml-1 text-[#2C2C26]/35">
+                · 完整 {cardHighlights.length}/{highlights.length}
+              </span>
             ) : null}
           </span>
         </div>
 
-      {/* Interactive Main Polaroid Card wrapper */}
-      <div 
-        ref={cardRef}
-        onClick={handleCardClick}
-        className="flex-1 w-full bg-white border border-[#2C2C26]/10 rounded-lg shadow-3xs relative flex flex-col justify-between overflow-hidden cursor-pointer active:scale-[0.99] transition-transform duration-100 mb-4"
-        title="双击卡片可以点赞 resonance 哦"
-      >
-        {/* Floating hearts anchor */}
-        {floatingHearts.map((h) => (
-          <div
-            key={h.id}
-            className="absolute z-50 text-rose-500/80 pointer-events-none animate-float-heart"
-            style={{ left: `${h.x}px`, top: `${h.y}px`, transform: "translate(-50%, -50%)" }}
+        <div
+          ref={cardRef}
+          onClick={handleCardClick}
+          className="flex-1 w-full bg-white border border-[#2C2C26]/10 rounded-lg shadow-3xs relative flex flex-col justify-between overflow-hidden cursor-pointer active:scale-[0.99] transition-transform duration-100 mb-4"
+          title="双击卡片可以点赞 resonance 哦"
+        >
+          {floatingHearts.map((h) => (
+            <div
+              key={h.id}
+              className="absolute z-50 text-rose-500/80 pointer-events-none animate-float-heart"
+              style={{ left: `${h.x}px`, top: `${h.y}px`, transform: "translate(-50%, -50%)" }}
+            >
+              <Heart className="w-12 h-12 fill-rose-500/75 text-rose-500" />
+            </div>
+          ))}
+
+          {renderStyledCard()}
+        </div>
+
+        <div className="flex items-center justify-between pt-3 border-t border-[#2C2C26]/10">
+          <button
+            onClick={() => navigateCard("up")}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-[#2C2C26]/5 text-[#2C2C26] border border-[#2C2C26]/10 rounded text-xs transition-colors cursor-pointer font-sans flex-shrink-0"
           >
-            <Heart className="w-12 h-12 fill-rose-500/75 text-rose-500" />
-          </div>
-        ))}
+            <ArrowUp className="w-3.5 h-3.5" />
+            <span>上句</span>
+          </button>
 
-        {renderStyledCard()}
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              handleDownloadImage();
+            }}
+            className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded text-xs border active:scale-[0.97] transition-colors cursor-pointer font-sans font-medium ${
+              copyStatus === "downloaded"
+                ? "bg-white border-emerald-300 text-emerald-700 hover:bg-emerald-50/20"
+                : copyStatus === "copied"
+                ? "bg-white border-emerald-300 text-emerald-700 hover:bg-emerald-50/20"
+                : copyStatus === "rendering"
+                ? "bg-[#2C2C26]/5 border-[#2C2C26]/20 text-[#2C2C26]/60 cursor-not-allowed"
+                : copyStatus === "failed"
+                ? "bg-white border-rose-300 text-rose-700 hover:bg-rose-50/20"
+                : "bg-white hover:bg-[#2C2C26]/5 text-[#2C2C26] border-[#2C2C26]/10"
+            }`}
+            disabled={copyStatus === "rendering"}
+            title="生成并下载当前读书金句卡片图片"
+            id="copy-btn-inner"
+          >
+            {copyStatus === "rendering" ? (
+              <>
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-[#2C2C26]/60" />
+                <span className="text-[11px]">绘制中...</span>
+              </>
+            ) : copyStatus === "downloaded" ? (
+              <>
+                <Check className="w-3.5 h-3.5 text-[#10B981]" />
+                <span className="text-[11px] font-semibold text-[#047857]">下载成功</span>
+              </>
+            ) : copyStatus === "copied" ? (
+              <>
+                <Check className="w-3.5 h-3.5 text-[#10B981]" />
+                <span className="text-[11px] font-semibold text-[#047857]">已存文本</span>
+              </>
+            ) : copyStatus === "failed" ? (
+              <>
+                <span className="text-[11px]">合并失败</span>
+              </>
+            ) : (
+              <>
+                <Download className="w-3.5 h-3.5" />
+                <span className="text-[11px]">下载卡片</span>
+              </>
+            )}
+          </button>
 
-      </div>
-
-      {/* Swipe Navigators */}
-      <div className="flex items-center justify-between pt-3 border-t border-[#2C2C26]/10">
-        <button 
-          onClick={() => navigateCard("up")}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-[#2C2C26]/5 text-[#2C2C26] border border-[#2C2C26]/10 rounded text-xs transition-colors cursor-pointer font-sans flex-shrink-0"
-        >
-          <ArrowUp className="w-3.5 h-3.5" />
-          <span>上句</span>
-        </button>
-
-        {/* Repositioned Card Photo Saver Button */}
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            handleDownloadImage();
-          }}
-          className={`flex items-center gap-1.5 px-3.5 py-1.5 rounded text-xs border active:scale-[0.97] transition-colors cursor-pointer font-sans font-medium ${
-            copyStatus === "downloaded"
-              ? "bg-white border-emerald-300 text-emerald-700 hover:bg-emerald-50/20"
-              : copyStatus === "copied"
-              ? "bg-white border-emerald-300 text-emerald-700 hover:bg-emerald-50/20"
-              : copyStatus === "rendering"
-              ? "bg-[#2C2C26]/5 border-[#2C2C26]/20 text-[#2C2C26]/60 cursor-not-allowed"
-              : copyStatus === "failed"
-              ? "bg-white border-rose-300 text-rose-700 hover:bg-rose-50/20"
-              : "bg-white hover:bg-[#2C2C26]/5 text-[#2C2C26] border-[#2C2C26]/10"
-          }`}
-          disabled={copyStatus === "rendering"}
-          title="生成并下载当前读书金句卡片图片"
-          id="copy-btn-inner"
-        >
-          {copyStatus === "rendering" ? (
-            <>
-              <Loader2 className="w-3.5 h-3.5 animate-spin text-[#2C2C26]/60" />
-              <span className="text-[11px]">绘制中...</span>
-            </>
-          ) : copyStatus === "downloaded" ? (
-            <>
-              <Check className="w-3.5 h-3.5 text-[#10B981]" />
-              <span className="text-[11px] font-semibold text-[#047857]">下载成功</span>
-            </>
-          ) : copyStatus === "copied" ? (
-            <>
-              <Check className="w-3.5 h-3.5 text-[#10B981]" />
-              <span className="text-[11px] font-semibold text-[#047857]">已存文本</span>
-            </>
-          ) : copyStatus === "failed" ? (
-            <>
-              <span className="text-[11px]">合并失败</span>
-            </>
-          ) : (
-            <>
-              <Download className="w-3.5 h-3.5" />
-              <span className="text-[11px]">下载卡片</span>
-            </>
-          )}
-        </button>
-
-        <button 
-          onClick={() => navigateCard("down")}
-          className="flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-[#2C2C26]/5 text-[#2C2C26] border border-[#2C2C26]/10 rounded text-xs transition-colors cursor-pointer font-sans flex-shrink-0"
-        >
-          <span>下句</span>
-          <ArrowDown className="w-3.5 h-3.5" />
-        </button>
-      </div>
+          <button
+            onClick={() => navigateCard("down")}
+            className="flex items-center gap-1.5 px-3 py-1.5 bg-white hover:bg-[#2C2C26]/5 text-[#2C2C26] border border-[#2C2C26]/10 rounded text-xs transition-colors cursor-pointer font-sans flex-shrink-0"
+          >
+            <span>下句</span>
+            <ArrowDown className="w-3.5 h-3.5" />
+          </button>
+        </div>
       </div>
     </div>
   );
+}
+
+function quoteTextKey(h: CardHighlight | undefined): string {
+  if (!h) return "";
+  return highlightCardKey(h);
 }

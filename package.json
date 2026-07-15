@@ -11,7 +11,8 @@
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
     "verify:publish": "tsx scripts/verify-publish.mjs",
-    "verify:card-excerpts": "tsx scripts/verify-card-excerpts.mjs"
+    "verify:card-excerpts": "tsx scripts/verify-card-excerpts.mjs",
+    "verify:card-dom": "tsx scripts/verify-card-dom.mjs"
   },
   "dependencies": {
     "@fontsource/fusion-pixel-12px-proportional-sc": "^5.2.5",
@@ -35,6 +36,7 @@
     "@types/node": "^22.14.0",
     "autoprefixer": "^10.4.21",
     "esbuild": "^0.25.0",
+    "playwright": "^1.58.2",
     "tailwindcss": "^4.1.14",
     "tsx": "^4.21.0",
     "typescript": "~5.8.2",
