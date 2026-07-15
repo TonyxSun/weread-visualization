@@ -246,12 +246,20 @@ export default function App() {
   const [selectedBookId, setSelectedBookId] = useState<string | null>(null);
   const dataCacheRef = useRef<Partial<Record<DataMode, CachedModeData>>>({});
   const analysisRunRef = useRef(0);
+  /** Server has ANALYSIS_*, XAI_*, or GEMINI env — model is "connected" even before first generation. */
+  const serverAnalysisReadyRef = useRef(false);
 
   useEffect(() => {
-    // Read-only model label from server env (ANALYSIS_*/XAI_*), never visitor config.
+    // Read-only model label + connection from server env (never visitor config).
     void getServerAnalysisStatus().then((st) => {
+      if (st.hasServerAnalysisKey) {
+        serverAnalysisReadyRef.current = true;
+        setAnalysisConnected(true);
+      }
       if (st.serverModel) {
-        setAnalysisModel((prev) => (prev && prev !== "本地语义分析" ? prev : st.serverModel!));
+        setAnalysisModel((prev) =>
+          !prev || prev === "本地语义分析" ? st.serverModel! : prev
+        );
       }
     });
   }, []);
@@ -330,11 +338,13 @@ export default function App() {
   ) => {
     if (activeBooks.length === 0) return;
     const runId = ++analysisRunRef.current;
+    const serverReady = serverAnalysisReadyRef.current;
 
     try {
       setAnalysisRetrying(true);
       setAnalysisError(null);
-      setAnalysisConnected(false);
+      // Keep green "connected" if server owns the model; only clear for true offline/local-only.
+      if (!serverReady) setAnalysisConnected(false);
 
       const analysis = normalizeAnalysisShape(
         await fetchAiAnalysis(activeBooks, activeHighlights),
@@ -348,6 +358,11 @@ export default function App() {
       const hasPreviousAiData = !!previousSnapshot?.isAiGenerated
         && previousSnapshot.yearlyPersonality.every((item) => item.annualQuestion && item.visualArchetype && item.artPersona && item.personaReason);
       const shouldKeepPrevious = isFallback && hasPreviousAiData;
+      const connected =
+        serverReady
+        || shouldKeepPrevious
+        || !!analysis?.isAiGenerated
+        || analysis?.analysisProvider === "configured";
 
       const nextSnapshot: CachedModeData = {
         ...(previousSnapshot || getCurrentSnapshot({
@@ -359,8 +374,10 @@ export default function App() {
         yearlyPersonality: shouldKeepPrevious ? previousSnapshot!.yearlyPersonality : (analysis?.yearlyPersonality || []),
         thoughtClusters: shouldKeepPrevious ? previousSnapshot!.thoughtClusters : (analysis?.thoughtClusters || []),
         isAiGenerated: shouldKeepPrevious ? true : !!analysis?.isAiGenerated,
-        analysisConnected: shouldKeepPrevious ? true : !!analysis?.isAiGenerated,
-        analysisModel: shouldKeepPrevious ? previousSnapshot!.analysisModel : (analysis?.analysisModel || getStoredAnalysisApiConfig().model || "本地语义分析")
+        analysisConnected: connected,
+        analysisModel: shouldKeepPrevious
+          ? previousSnapshot!.analysisModel
+          : (analysis?.analysisModel || (serverReady ? analysisModel : getStoredAnalysisApiConfig().model) || "本地语义分析")
       };
 
       if (nextSnapshot.isAiGenerated) {
@@ -379,13 +396,27 @@ export default function App() {
       if (runId === analysisRunRef.current) {
         const message = error?.message || "分析暂时不可用，请稍后重试。";
         setAnalysisError(message);
-        setAnalysisConnected(false);
+        // Server still has a configured model even if this request failed.
+        setAnalysisConnected(serverAnalysisReadyRef.current);
       }
     } finally {
       if (runId === analysisRunRef.current) {
         setAnalysisRetrying(false);
       }
     }
+  };
+
+  /** Kick off personality analysis after books load (skip if cache already has AI result). */
+  const maybeAutoAnalyze = (
+    books: WeReadNotebook[],
+    activeHighlights: HighlightWithBook[],
+    baseSnapshot?: CachedModeData
+  ) => {
+    if (!books.length) return;
+    if (baseSnapshot?.isAiGenerated && (baseSnapshot.yearlyPersonality?.length || 0) > 0) {
+      return;
+    }
+    void runAnalysisForData(DATA_MODE, books, activeHighlights, baseSnapshot);
   };
 
   const shuffleHighlights = <T,>(arr: T[]): T[] => {
@@ -412,6 +443,7 @@ export default function App() {
           bookCover: h.bookCover || ""
         })) as HighlightWithBook[]
       );
+      const cachedAnalysis = readStoredAnalysis("weread", snapshot.notebooks || [], highlights);
       const snapshotData: CachedModeData = {
         notebooks: snapshot.notebooks || [],
         stats: snapshot.stats as WeReadOverallStats | null,
@@ -419,13 +451,18 @@ export default function App() {
         yearlyPersonality: [],
         thoughtClusters: [],
         isAiGenerated: false,
-        analysisConnected: false,
-        analysisModel: getStoredAnalysisApiConfig().model || "本地语义分析",
-        ...(readStoredAnalysis("weread", snapshot.notebooks || [], highlights) || {})
+        analysisConnected: serverAnalysisReadyRef.current,
+        analysisModel: analysisModel || getStoredAnalysisApiConfig().model || "本地语义分析",
+        ...(cachedAnalysis || {})
       };
+      if (serverAnalysisReadyRef.current) {
+        snapshotData.analysisConnected = true;
+      }
       saveCachedData("weread", snapshotData);
       applyCachedData(snapshotData);
       setLoading(false);
+      // Analyze as soon as we have shelf data (don't wait for full highlight sync).
+      maybeAutoAnalyze(snapshotData.notebooks, snapshotData.highlights, snapshotData);
 
       const syncStart = await triggerSync(Boolean(options.force));
       const syncRunId = syncStart.syncRunId;
@@ -466,15 +503,22 @@ export default function App() {
             bookCover: h.bookCover || ""
           })) as HighlightWithBook[]
         );
+        const prev = dataCacheRef.current.weread || snapshotData;
         const refreshed: CachedModeData = {
           ...snapshotData,
+          ...prev,
           notebooks: fresh.notebooks || [],
           stats: fresh.stats as WeReadOverallStats | null,
           highlights: freshHighlights,
+          analysisConnected: serverAnalysisReadyRef.current || prev.analysisConnected,
           ...(readStoredAnalysis("weread", fresh.notebooks || [], freshHighlights) || {})
         };
         saveCachedData("weread", refreshed);
         applyCachedData(refreshed);
+        // Re-run if we still have no AI personality after full sync (more highlight context).
+        if (!refreshed.isAiGenerated) {
+          maybeAutoAnalyze(refreshed.notebooks, refreshed.highlights, refreshed);
+        }
       }
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err);
@@ -554,6 +598,7 @@ export default function App() {
 
       const resolvedHighlights = notesByBook.flat();
       const shuffled = shuffleHighlights(resolvedHighlights);
+      const cachedAnalysis = readStoredAnalysis("weread", notebooksRes.books, shuffled);
       const snapshot: CachedModeData = {
         notebooks: notebooksRes.books,
         stats: statsRes,
@@ -561,21 +606,27 @@ export default function App() {
         yearlyPersonality: [],
         thoughtClusters: [],
         isAiGenerated: false,
-        analysisConnected: false,
-        analysisModel: getStoredAnalysisApiConfig().model || "本地语义分析",
-        ...(readStoredAnalysis("weread", notebooksRes.books, shuffled) || {})
+        analysisConnected: serverAnalysisReadyRef.current,
+        analysisModel: analysisModel || getStoredAnalysisApiConfig().model || "本地语义分析",
+        ...(cachedAnalysis || {})
       };
+      if (serverAnalysisReadyRef.current) snapshot.analysisConnected = true;
       saveCachedData("weread", snapshot);
       applyCachedData(snapshot);
+      maybeAutoAnalyze(snapshot.notebooks, snapshot.highlights, snapshot);
   };
 
   const loadData = async (options: { force?: boolean } = {}) => {
     let usedServerSync = false;
     try {
       if (!options.force && dataCacheRef.current[DATA_MODE]) {
-        applyCachedData(dataCacheRef.current[DATA_MODE]!);
+        const cached = dataCacheRef.current[DATA_MODE]!;
+        applyCachedData(cached);
         setError(null);
         setLoading(false);
+        if (!cached.isAiGenerated) {
+          maybeAutoAnalyze(cached.notebooks, cached.highlights, cached);
+        }
         return;
       }
 
@@ -774,6 +825,7 @@ export default function App() {
                       <BrainCircuit className="w-3 h-3 text-[#2C2C26]/55" />
                       <span className="max-w-[260px] truncate text-[#2C2C26]/85" title={analysisModel}>
                         分析模型：{analysisModel}
+                        {!analysisConnected ? "（未配置）" : !isAiGenerated && analysisRetrying ? "（生成中…）" : !isAiGenerated ? "（已连接）" : ""}
                       </span>
                       {notebooks.length > 0 && (
                         <button
@@ -807,6 +859,7 @@ export default function App() {
                         notebooks={notebooks}
                         yearlyPersonality={yearlyPersonality}
                         isAiGenerated={isAiGenerated}
+                        analysisConnected={analysisConnected}
                         onReanalyze={retryAnalysis}
                         isAnalyzing={analysisRetrying}
                         selectedBookId={selectedBookId}

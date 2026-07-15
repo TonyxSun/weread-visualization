@@ -22,6 +22,8 @@ interface GrowthMapProps {
     description: string;
   }>;
   isAiGenerated: boolean;
+  /** Server has a configured analysis model (env key). Independent of whether results exist yet. */
+  analysisConnected?: boolean;
   onReanalyze?: () => void;
   isAnalyzing?: boolean;
   selectedBookId?: string | null;
@@ -178,7 +180,7 @@ function BookColorItem({ item, selected, onSelectBook, onDeleteBook }: BookColor
   );
 }
 
-export default function GrowthMap({ notebooks, yearlyPersonality, isAiGenerated, onReanalyze, isAnalyzing, selectedBookId, onSelectBook, onDeleteBook }: GrowthMapProps) {
+export default function GrowthMap({ notebooks, yearlyPersonality, isAiGenerated, analysisConnected = false, onReanalyze, isAnalyzing, selectedBookId, onSelectBook, onDeleteBook }: GrowthMapProps) {
 
   const handleDownload = () => {
     const element = document.getElementById("growth-map-container");
@@ -293,12 +295,24 @@ export default function GrowthMap({ notebooks, yearlyPersonality, isAiGenerated,
               ? yearlyPersonality.find(yp => Number(yp.year) === year) || {
                   year,
                   title: "模型未生成",
-                  description: "当前模型已连接，但还没有返回该年度的阅读人格。请点击画布上的重试，重新生成本年度阅读人格。"
+                  description: "当前模型已连接，但还没有返回该年度的阅读人格。请点击「重新分析」，重新生成本年度阅读人格。"
+                }
+              : isAnalyzing
+              ? {
+                  year,
+                  title: "分析生成中",
+                  description: "正在调用服务端分析模型生成年度阅读人格，请稍候…"
+                }
+              : analysisConnected
+              ? {
+                  year,
+                  title: "待生成",
+                  description: "分析模型已连接。点击「重新分析」生成该年度阅读人格。"
                 }
               : {
                   year,
-                  title: "模型未连接",
-                  description: "分析服务暂未返回本年度阅读人格，可点击「重新分析」重试。"
+                  title: "分析未配置",
+                  description: "服务端未配置分析模型（XAI_API_KEY / ANALYSIS_API_KEY / GEMINI_API_KEY）。配置后刷新即可自动生成。"
                 };
             const yearBooks = groupedBooks[year] || [];
 
