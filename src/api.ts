@@ -5,15 +5,22 @@
 
 import { WeReadOverallStats, WeReadNotebook, WeReadBookNotesResponse, WeReadHighlight } from "./types";
 import { getNotebookReadingTimestamp } from "./utils/wereadDates";
+import {
+  buildWereadServerAuthHeaders,
+  buildWereadProxyBody,
+  buildAnalyzeRequestBody,
+  DEFAULT_GATEWAY_URL,
+  DEFAULT_SKILL_VERSION
+} from "./publishAuth";
 
-const LOCAL_STORAGE_KEY_API_KEY = "weread_api_key";
-const LOCAL_STORAGE_KEY_GATEWAY_URL = "weread_gateway_url";
-const LOCAL_STORAGE_KEY_SKILL_URL = "weread_skill_url";
-const LOCAL_STORAGE_KEY_SKILL_VERSION = "weread_skill_version";
-const LOCAL_STORAGE_KEY_SKILL_INSTALL_COMMAND = "weread_skill_install_command";
-const LOCAL_STORAGE_KEY_ANALYSIS_API_ENDPOINT = "reading_analysis_api_endpoint";
-const LOCAL_STORAGE_KEY_ANALYSIS_API_KEY = "reading_analysis_api_key";
-const LOCAL_STORAGE_KEY_ANALYSIS_MODEL = "reading_analysis_model";
+export {
+  buildWereadServerAuthHeaders,
+  buildWereadProxyBody,
+  buildAnalyzeRequestBody,
+  DEFAULT_GATEWAY_URL,
+  DEFAULT_SKILL_VERSION
+} from "./publishAuth";
+
 const WEREAD_PROXY_TIMEOUT_MS = 180000;
 const WEREAD_PROXY_RETRIES = 6;
 const WEREAD_MAX_CONCURRENT = 2;
@@ -23,11 +30,9 @@ const NOTEBOOK_FETCH_MIN_COUNT = 100;
 const NOTEBOOK_FETCH_MAX_COUNT = 5000;
 
 export const DEFAULT_API_KEY = "";
-export const DEFAULT_GATEWAY_URL = "https://i.weread.qq.com/api/agent/gateway";
-export const DEFAULT_SKILL_VERSION = "1.0.5";
 export const DEFAULT_SKILL_INSTALL_COMMAND = "npx skills add Tencent/WeChatReading -g";
 export const DEFAULT_ANALYSIS_API_ENDPOINT = "https://ark.cn-beijing.volces.com/api/v3/responses";
-export const DEFAULT_ANALYSIS_MODEL = "doubao-seed-2-0-lite-260428";
+export const DEFAULT_ANALYSIS_MODEL = "本地语义分析";
 
 /** Server SQLite sync enabled unless explicitly WEREAD_SERVER_SYNC=0 */
 export const SERVER_SYNC_ENABLED = import.meta.env.WEREAD_SERVER_SYNC !== "0";
@@ -65,26 +70,12 @@ export interface WeReadSyncStatusResponse {
   error?: string;
 }
 
+/** Publish mode: never attach visitor secrets; server env supplies WEREAD_API_KEY. */
 async function wereadServerAuthHeaders(): Promise<Record<string, string>> {
-  let apiKey = getStoredApiKey();
-  let useServer = false;
-  if (!isConcreteSecret(apiKey)) {
-    const st = await getServerWereadStatus().catch(() => ({ hasServerWereadKey: false }));
-    if (st.hasServerWereadKey) {
-      useServer = true;
-    } else {
-      throw new Error("API Key (Bearer Token) is required");
-    }
-  }
-  const headers: Record<string, string> = {
-    "X-WeRead-Gateway-Url": getStoredGatewayUrl(),
-    "X-WeRead-Skill-Version": getStoredSkillVersion(),
-    "Content-Type": "application/json"
-  };
-  if (!useServer) {
-    headers.Authorization = `Bearer ${stripShellValue(apiKey)}`;
-  }
-  return headers;
+  return buildWereadServerAuthHeaders({
+    gatewayUrl: getStoredGatewayUrl(),
+    skillVersion: getStoredSkillVersion()
+  });
 }
 
 export async function fetchSnapshot(): Promise<WeReadSnapshotResponse> {
@@ -190,259 +181,82 @@ function stripShellValue(value: string): string {
     .trim();
 }
 
-function isConcreteSecret(value?: string): value is string {
-  if (!value) return false;
-  const cleaned = stripShellValue(value);
-  if (!cleaned) return false;
-  if (/^\$|process\.env|os\.environ|your[_-]?|example|placeholder|<|>|\{|\}/i.test(cleaned)) return false;
-  if (/^[A-Z0-9_]+_API_KEY$/i.test(cleaned)) return false;
-  return cleaned.length >= 8;
-}
-
-function firstMatch(text: string, patterns: RegExp[]): string | undefined {
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match?.[1]) return stripShellValue(match[1]);
-  }
-  return undefined;
-}
-
-function appendEndpointPath(url: URL, suffix: string, defaultBasePath = ""): string {
-  const cleanPath = url.pathname.replace(/\/+$/g, "");
-  const basePath = cleanPath && cleanPath !== "" ? cleanPath : defaultBasePath;
-  url.pathname = `${basePath}/${suffix}`.replace(/\/{2,}/g, "/");
-  return url.toString().replace(/\/$/g, "");
-}
-
-export function normalizeAnalysisEndpoint(rawEndpoint: string, model = "", sourceText = ""): string {
-  const endpoint = stripShellValue(rawEndpoint);
-  if (!endpoint) return "";
-
-  try {
-    const url = new URL(endpoint);
-    const host = url.hostname.toLowerCase();
-    const pathName = url.pathname.replace(/\/+$/g, "");
-    const lowerPath = pathName.toLowerCase();
-    const source = `${sourceText}\n${model}\n${endpoint}`.toLowerCase();
-
-    if (/\/(responses|chat\/completions|messages)$/.test(lowerPath)) {
-      url.pathname = pathName || url.pathname;
-      return url.toString().replace(/\/$/g, "");
-    }
-
-    const isAnthropic = host.includes("anthropic") || /^claude/i.test(model) || /anthropic|messages\.create|\/v1\/messages/.test(source);
-    if (isAnthropic) {
-      if (!lowerPath || lowerPath === "/") return appendEndpointPath(url, "messages", "/v1");
-      if (lowerPath.endsWith("/v1")) return appendEndpointPath(url, "messages");
-      return appendEndpointPath(url, "messages");
-    }
-
-    const prefersChat = /chat\.completions|\/chat\/completions/.test(source);
-    const prefersResponses = !prefersChat && (/responses\.create|\/responses\b|response api/.test(source)
-      || (host.includes("openai") && /^(gpt-|o\d|o[134]|chatgpt)/i.test(model))
-      || (host.includes("volces") && /doubao|seed|ark/.test(source))
-      || host.includes("ark.cn-"));
-    const suffix = prefersResponses ? "responses" : "chat/completions";
-
-    if (host.includes("openai")) {
-      return appendEndpointPath(url, suffix, "/v1");
-    }
-
-    if (host.includes("moonshot")) {
-      return appendEndpointPath(url, "chat/completions", lowerPath.includes("/v1") ? "" : "/v1");
-    }
-
-    if (host.includes("deepseek")) {
-      return appendEndpointPath(url, "chat/completions");
-    }
-
-    if (host.includes("volces") || host.includes("ark.cn-")) {
-      return appendEndpointPath(url, suffix, lowerPath.includes("/api/v3") ? "" : "/api/v3");
-    }
-
-    if (lowerPath.endsWith("/v1") || lowerPath.endsWith("/api/v3")) {
-      return appendEndpointPath(url, suffix);
-    }
-
-    return url.toString().replace(/\/$/g, "");
-  } catch {
-    return endpoint;
-  }
-}
-
-function inferDefaultAnalysisEndpoint(model = "", sourceText = ""): string | undefined {
-  const source = `${sourceText}\n${model}`.toLowerCase();
-  if (/claude|anthropic/.test(source)) return "https://api.anthropic.com/v1/messages";
-  if (/deepseek/.test(source)) return "https://api.deepseek.com/chat/completions";
-  if (/kimi|moonshot/.test(source)) return "https://api.moonshot.cn/v1/chat/completions";
-  if (/doubao|volces|ark/.test(source)) return DEFAULT_ANALYSIS_API_ENDPOINT;
-  if (/gpt-|openai|responses\.create|chat\.completions/.test(source)) {
-    return /chat\.completions/.test(source)
-      ? "https://api.openai.com/v1/chat/completions"
-      : "https://api.openai.com/v1/responses";
-  }
-  return undefined;
-}
-
-function envWeReadApiKey(): string {
-  const value = import.meta.env.WEREAD_API_KEY;
-  return isConcreteSecret(value) ? stripShellValue(value) : "";
-}
-
 function envWeReadGatewayUrl(): string {
-  const value = import.meta.env.WEREAD_API_URL;
-  const cleaned = value ? stripShellValue(value) : "";
-  return cleaned || DEFAULT_GATEWAY_URL;
+  try {
+    const value = import.meta.env?.WEREAD_API_URL;
+    const cleaned = value ? stripShellValue(String(value)) : "";
+    return cleaned || DEFAULT_GATEWAY_URL;
+  } catch {
+    return DEFAULT_GATEWAY_URL;
+  }
 }
 
+/** Publish mode: API keys are server-only; client never exposes stored secrets. */
 export function getStoredApiKey(): string {
-  if (typeof window !== "undefined") {
-    const stored = localStorage.getItem(LOCAL_STORAGE_KEY_API_KEY);
-    if (isConcreteSecret(stored || undefined)) return stripShellValue(stored!);
-    return envWeReadApiKey() || DEFAULT_API_KEY;
-  }
   return DEFAULT_API_KEY;
 }
 
-export function setStoredApiKey(key: string): void {
-  if (typeof window !== "undefined") {
-    localStorage.setItem(LOCAL_STORAGE_KEY_API_KEY, key);
-  }
+export function setStoredApiKey(_key: string): void {
+  // no-op: secrets are managed via server env
 }
 
 export function getStoredGatewayUrl(): string {
-  if (typeof window !== "undefined") {
-    const stored = localStorage.getItem(LOCAL_STORAGE_KEY_GATEWAY_URL);
-    if (stored?.trim()) return stored.trim();
-    return envWeReadGatewayUrl();
-  }
-  return DEFAULT_GATEWAY_URL;
+  return envWeReadGatewayUrl();
 }
 
-export function setStoredGatewayUrl(url: string): void {
-  if (typeof window !== "undefined") {
-    localStorage.setItem(LOCAL_STORAGE_KEY_GATEWAY_URL, url);
-  }
+export function setStoredGatewayUrl(_url: string): void {
+  // no-op: gateway configured server-side
 }
 
 export function getStoredSkillUrl(): string {
-  if (typeof window !== "undefined") {
-    return localStorage.getItem(LOCAL_STORAGE_KEY_SKILL_URL) || "";
-  }
   return "";
 }
 
-export function setStoredSkillUrl(url: string): void {
-  if (typeof window !== "undefined") {
-    localStorage.setItem(LOCAL_STORAGE_KEY_SKILL_URL, url);
-  }
+export function setStoredSkillUrl(_url: string): void {
+  // no-op
 }
 
 export function getStoredSkillVersion(): string {
-  if (typeof window !== "undefined") {
-    return localStorage.getItem(LOCAL_STORAGE_KEY_SKILL_VERSION) || DEFAULT_SKILL_VERSION;
-  }
   return DEFAULT_SKILL_VERSION;
 }
 
-export function setStoredSkillVersion(version: string): void {
-  if (typeof window !== "undefined") {
-    localStorage.setItem(LOCAL_STORAGE_KEY_SKILL_VERSION, version || DEFAULT_SKILL_VERSION);
-  }
+export function setStoredSkillVersion(_version: string): void {
+  // no-op
 }
 
 export function getStoredSkillInstallCommand(): string {
-  if (typeof window !== "undefined") {
-    return localStorage.getItem(LOCAL_STORAGE_KEY_SKILL_INSTALL_COMMAND) || DEFAULT_SKILL_INSTALL_COMMAND;
-  }
   return DEFAULT_SKILL_INSTALL_COMMAND;
 }
 
-export function setStoredSkillInstallCommand(command: string): void {
-  if (typeof window !== "undefined") {
-    localStorage.setItem(LOCAL_STORAGE_KEY_SKILL_INSTALL_COMMAND, command || DEFAULT_SKILL_INSTALL_COMMAND);
-  }
+export function setStoredSkillInstallCommand(_command: string): void {
+  // no-op
 }
 
+/** Read-only display config; never includes visitor-entered secrets. */
 export function getStoredAnalysisApiConfig(): AnalysisApiConfig {
-  const storedModel = typeof window !== "undefined"
-    ? localStorage.getItem(LOCAL_STORAGE_KEY_ANALYSIS_MODEL) || DEFAULT_ANALYSIS_MODEL
-    : DEFAULT_ANALYSIS_MODEL;
-  const storedEndpoint = typeof window !== "undefined"
-    ? localStorage.getItem(LOCAL_STORAGE_KEY_ANALYSIS_API_ENDPOINT) || DEFAULT_ANALYSIS_API_ENDPOINT
-    : DEFAULT_ANALYSIS_API_ENDPOINT;
-
-  if (typeof window === "undefined") {
-    return {
-      endpoint: normalizeAnalysisEndpoint(storedEndpoint, storedModel),
-      apiKey: "",
-      model: storedModel
-    };
-  }
-
   return {
-    endpoint: normalizeAnalysisEndpoint(storedEndpoint, storedModel),
-    apiKey: localStorage.getItem(LOCAL_STORAGE_KEY_ANALYSIS_API_KEY) || "",
-    model: storedModel
+    endpoint: "",
+    apiKey: "",
+    model: DEFAULT_ANALYSIS_MODEL
   };
 }
 
-export function setStoredAnalysisApiConfig(config: AnalysisApiConfig): void {
-  if (typeof window !== "undefined") {
-    const model = config.model.trim() || DEFAULT_ANALYSIS_MODEL;
-    localStorage.setItem(LOCAL_STORAGE_KEY_ANALYSIS_API_ENDPOINT, normalizeAnalysisEndpoint(config.endpoint.trim() || DEFAULT_ANALYSIS_API_ENDPOINT, model));
-    localStorage.setItem(LOCAL_STORAGE_KEY_ANALYSIS_API_KEY, config.apiKey.trim());
-    localStorage.setItem(LOCAL_STORAGE_KEY_ANALYSIS_MODEL, model);
-  }
+export function setStoredAnalysisApiConfig(_config: AnalysisApiConfig): void {
+  // no-op: analysis providers are configured via server env
 }
 
-export function parseAnalysisCurl(raw: string): Partial<AnalysisApiConfig> {
-  const text = raw.trim();
-  if (!text) return {};
-
-  const model = firstMatch(text, [
-    /"model"\s*:\s*"([^"]+)"/i,
-    /'model'\s*:\s*'([^']+)'/i,
-    /\bmodel\s*[:=]\s*["'`]([^"'`]+)["'`]/i
-  ]);
-  const endpointCandidate = firstMatch(text, [
-    /\bcurl\s+(?:-X\s+POST\s+)?["']?(https?:\/\/[^\s'"\\)]+)/i,
-    /\b(?:base_url|baseURL|endpoint|url)\s*[:=]\s*["'`](https?:\/\/[^"'`\s]+)["'`]/i,
-    /(https?:\/\/[^\s'"\}\\)]+)/i
-  ]);
-  const keyCandidate = firstMatch(text, [
-    /Authorization:\s*Bearer\s+([^'"\s\\]+)/i,
-    /x-api-key:\s*([^'"\s\\]+)/i,
-    /\bapi[-_]?key\b\s*[:=]\s*["'`]([^"'`]+)["'`]/i,
-    /\bapiKey\b\s*[:=]\s*["'`]([^"'`]+)["'`]/i
-  ]);
-  const endpoint = endpointCandidate
-    ? normalizeAnalysisEndpoint(endpointCandidate, model || "", text)
-    : inferDefaultAnalysisEndpoint(model || "", text);
-
-  return {
-    ...(endpoint ? { endpoint } : {}),
-    ...(isConcreteSecret(keyCandidate) ? { apiKey: stripShellValue(keyCandidate) } : {}),
-    ...(model ? { model } : {})
-  };
+export function parseAnalysisCurl(_raw: string): Partial<AnalysisApiConfig> {
+  return {};
 }
 
 /**
  * Universal safe query execution going through our Express proxy
  */
 async function callWeReadProxy(apiName: string, params: any = {}): Promise<any> {
-  let apiKey = getStoredApiKey();
-  const gatewayUrl = getStoredGatewayUrl();
-  const skillVersion = getStoredSkillVersion();
-
-  if (!isConcreteSecret(apiKey)) {
-    const st = await getServerWereadStatus().catch(() => ({ hasServerWereadKey: false }));
-    if (st.hasServerWereadKey) {
-      apiKey = "";
-    } else {
-      throw new Error("API Key (Bearer Token) is required");
-    }
-  }
+  const proxyBody = buildWereadProxyBody(apiName, params, {
+    gatewayUrl: getStoredGatewayUrl(),
+    skillVersion: getStoredSkillVersion()
+  });
 
   let lastError: Error | null = null;
   await acquireWeReadSlot();
@@ -457,13 +271,7 @@ async function callWeReadProxy(apiName: string, params: any = {}): Promise<any> 
           headers: {
             "Content-Type": "application/json"
           },
-          body: JSON.stringify({
-            targetUrl: gatewayUrl,
-            apiKey: apiKey,
-            api_name: apiName,
-            skill_version: skillVersion,
-            ...params
-          }),
+          body: JSON.stringify(proxyBody),
           signal: controller.signal
         });
 
@@ -600,31 +408,15 @@ export async function fetchBookNotes(bookId: string): Promise<WeReadBookNotesRes
  * Fetch AI Synthesized Personality/Mindmap from our fast lazy Gemini proxy
  */
 export async function fetchAiAnalysis(books: any[], highlights: any[]): Promise<any> {
-  const analysisConfig = getStoredAnalysisApiConfig();
   const response = await fetch("/api/weread/analyze", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ books, highlights, analysisConfig })
+    body: JSON.stringify(buildAnalyzeRequestBody(books, highlights))
   });
   const result = await response.json().catch(() => ({}));
   if (!response.ok) {
     throw new Error(result?.error || result?.message || `Analyze server error: ${response.status}`);
   }
-  return result;
-}
-
-export async function testAnalysisApiConfig(config: AnalysisApiConfig): Promise<{ ok: boolean; model: string; message?: string }> {
-  const response = await fetch("/api/analysis/test", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ analysisConfig: config })
-  });
-
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok || !result.ok) {
-    throw new Error(result?.message || `分析模型连接失败：${response.status}`);
-  }
-
   return result;
 }
 

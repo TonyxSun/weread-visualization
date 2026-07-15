@@ -56,6 +56,7 @@ WeRead Agent Gateway (/user/notebooks, /book/bookmarklist, /readdata/detail, …
 
 - **需要** 长期运行的 Node 进程与可写 `data/` 目录：`npm run dev` / `npm run start`。
 - **Netlify 静态发布**（仅 `dist/`）无法使用服务端同步；可设 `WEREAD_SERVER_SYNC=0` 回退为纯浏览器冷同步。
+- **发布到个人站点时**：密钥与模型只在服务端配置。前端不再提供 API Key / 分析模型设置面板；访客无法在页面上填写或保存密钥。
 
 更完整的设计说明见 [`docs/design-server-sync-cache.md`](docs/design-server-sync-cache.md)。
 
@@ -79,18 +80,18 @@ npm run dev
 
 默认服务地址为 `http://localhost:3000`。
 
-复制 `.env.example` 为 `.env`，按需配置：
+复制 `.env.example` 为 `.env`，**仅在服务端**配置：
 
 | 变量 | 说明 |
 |------|------|
-| `WEREAD_API_KEY` | 微信读书网关 Token（服务端代理、定时刷新、及可选的浏览器数据加载后备）。设置后「数据源设置」面板的 API Key 可留空，由服务器回退读取 .env。 |
+| `WEREAD_API_KEY` | **必需**（发布模式）。微信读书网关 Token；服务端代理、SQLite 同步与定时刷新均只读此环境变量。 |
 | `WEREAD_API_URL` | 网关地址（默认官方 Agent Gateway） |
-| `WEREAD_SERVER_SYNC` | `1` 启用 SQLite 缓存（默认）；`0` 仅用浏览器全量拉取 |
+| `WEREAD_SERVER_SYNC` | `1` 启用 SQLite 缓存（默认）；`0` 仅用浏览器经服务端代理拉取 |
 | `SERVER_SECRET` | 可选，32+ 字符，用于加密存储 API Key 以支持无浏览器定时刷新 |
-| `GEMINI_API_KEY` | 可选，服务端 Gemini 分析 |
-| `XAI_API_KEY` / `ANALYSIS_API_KEY` | 可选，服务端外部模型分析（xAI Grok / OpenAI 等）。设置后浏览器「分析模型」面板的 Key 可留空，由服务器读取 .env（优先级：客户端提供 > 服务端 env）。支持 Responses/Chat 格式。 |
+| `XAI_API_KEY` / `ANALYSIS_API_KEY` + `ANALYSIS_API_ENDPOINT` / `ANALYSIS_API_MODEL` | 可选，服务端 AI 分析（xAI / OpenAI-compatible 等） |
+| `GEMINI_API_KEY` | 可选，服务端 Gemini 分析后备 |
 
-浏览器「数据源设置」中的 Token 会随 Authorization 头传给 snapshot/sync（若留空且服务端 .env 有 WEREAD_API_KEY 则自动使用服务端值）。与 `.env` 中的 key 应对同一账号以便后台刷新匹配。
+发布模式不在浏览器保存密钥；页面上的「分析模型」标签为只读状态（来自服务端或本地语义分析结果）。
 
 ## 常用命令
 
@@ -99,10 +100,11 @@ npm run dev      # 启动开发服务
 npm run build    # 构建前端和服务端产物
 npm run start    # 运行构建后的服务
 npm run lint     # TypeScript 类型检查
+npm run verify:publish  # 发布模式静态检查 + 无客户端密钥请求路径
 ```
 
 ## 敏感信息说明
 
 - `.env*` 默认被忽略，只有 `.env.example` 会进入版本库。
 - `dist/`、`node_modules/`、日志文件和系统文件不会进入版本库。
-- 微信读书网关 Token、第三方模型 API Key 等信息只应保存在本地浏览器或私有环境变量中。
+- 微信读书网关 Token、第三方模型 API Key 等信息只应保存在**服务端私有环境变量**中，不要写进前端或提交到仓库。

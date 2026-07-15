@@ -12,8 +12,7 @@ import {
   fetchBookNotes,
   fetchAiAnalysis,
   getStoredAnalysisApiConfig,
-  getStoredApiKey,
-  AnalysisApiConfig,
+  getServerAnalysisStatus,
   SERVER_SYNC_ENABLED,
   fetchSnapshot,
   triggerSync,
@@ -21,8 +20,6 @@ import {
 } from "./api";
 import { mapServerPhaseToOverlay } from "./components/IndexingOverlay";
 import InfiniteCanvas from "./components/InfiniteCanvas";
-import SettingsPanel from "./components/SettingsPanel";
-import AnalysisSettingsPanel from "./components/AnalysisSettingsPanel";
 import GrowthMap from "./components/GrowthMap";
 import CognitiveLandscape from "./components/CognitiveLandscape";
 import RelationshipMap from "./components/RelationshipMap";
@@ -90,9 +87,8 @@ function hashString(input: string): string {
 }
 
 function buildAnalysisCacheKey(mode: DataMode, books: WeReadNotebook[], highlights: HighlightWithBook[]): string {
-  const config = getStoredAnalysisApiConfig();
-  const modelPart = `${config.endpoint}|${config.model}`;
-  return `${ANALYSIS_CACHE_PREFIX}:${mode}:${hashString(`${modelPart}::${buildAnalysisSourceSignature(books, highlights)}`)}`;
+  // Server-managed analysis; cache by data signature only (no client endpoint/key).
+  return `${ANALYSIS_CACHE_PREFIX}:${mode}:${hashString(buildAnalysisSourceSignature(books, highlights))}`;
 }
 
 function buildAnalysisSourceSignature(books: WeReadNotebook[], highlights: HighlightWithBook[]): string {
@@ -289,7 +285,6 @@ export default function App() {
   const [analysisError, setAnalysisError] = useState<string | null>(null);
   const [rightPanelCollapsed, setRightPanelCollapsed] = useState<boolean>(false);
   const [selectedBookId, setSelectedBookId] = useState<string | null>(null);
-  const shouldShowWeReadOnboardingError = mode === "weread" && !getStoredApiKey().trim();
   const dataCacheRef = useRef<Partial<Record<DataMode, CachedModeData>>>({});
   const modeRef = useRef<DataMode>(mode);
   const analysisRunRef = useRef(0);
@@ -297,6 +292,15 @@ export default function App() {
   useEffect(() => {
     modeRef.current = mode;
   }, [mode]);
+
+  useEffect(() => {
+    // Read-only model label from server env (ANALYSIS_*/XAI_*), never visitor config.
+    void getServerAnalysisStatus().then((st) => {
+      if (st.serverModel) {
+        setAnalysisModel((prev) => (prev && prev !== "本地语义分析" ? prev : st.serverModel!));
+      }
+    });
+  }, []);
 
   const applyCachedData = (cached: CachedModeData) => {
     setNotebooks(cached.notebooks);
@@ -423,7 +427,7 @@ export default function App() {
       }
     } catch (error: any) {
       if (runId === analysisRunRef.current) {
-        const message = error?.message || "分析模型请求失败，请检查模型配置后重试。";
+        const message = error?.message || "分析暂时不可用，请稍后重试。";
         setAnalysisError(message);
         setAnalysisConnected(false);
       }
@@ -705,7 +709,7 @@ export default function App() {
 
     } catch (err: any) {
       console.error(err);
-      setError(err?.message || "无法拉取微信读书数据，请检查网关和认证Key配置。");
+      setError(err?.message || "无法拉取阅读数据，请稍后重试。");
     } finally {
       if (!usedServerSync) {
         setIndexingProgress(null);
@@ -720,15 +724,6 @@ export default function App() {
     setMode(target);
     modeRef.current = target;
     loadData(target);
-  };
-
-  const handleWeReadSettingsRefresh = () => {
-    setSelectedBookId(null);
-    delete dataCacheRef.current.weread;
-    localStorage.setItem("weread_active_mode", "weread");
-    setMode("weread");
-    modeRef.current = "weread";
-    loadData("weread", { force: true });
   };
 
   const handleImportComplete = (imported: { books: any[]; highlights: any[] }) => {
@@ -799,12 +794,6 @@ export default function App() {
     await deleteBookById(selectedBookId);
   };
 
-  const handleAnalysisConfigSaved = (config: AnalysisApiConfig, connected: boolean) => {
-    setAnalysisModel(config.model || "未命名模型");
-    setAnalysisConnected(connected);
-    setAnalysisError(null);
-  };
-
   const retryAnalysis = async () => {
     if (notebooks.length === 0) return;
     await runAnalysisForData(modeRef.current, notebooks, highlights);
@@ -822,8 +811,6 @@ export default function App() {
         target?.closest("textarea") ||
               target?.closest("select") ||
               target?.closest("[contenteditable='true']") ||
-              target?.closest("#settings-panel") ||
-              target?.closest("#analysis-settings-panel") ||
               target?.closest("#obsidian-importer-panel")
       ) {
         return;
@@ -888,9 +875,6 @@ export default function App() {
 
         {/* View Switchers for split layouts */}
         <div className="flex items-center gap-3">
-          {/* Obsidian-specific Upload/Clear Actions */}
-          <AnalysisSettingsPanel onSaved={handleAnalysisConfigSaved} />
-
           {mode === "obsidian" && (
             <div className="flex items-center gap-2">
               <button
@@ -958,10 +942,6 @@ export default function App() {
               📱 随感划线
             </button>
           </div>
-
-          {mode === "weread" && (
-            <SettingsPanel onRefresh={handleWeReadSettingsRefresh} isLoading={loading} initiallyOpen />
-          )}
         </div>
       </header>
 
@@ -972,19 +952,17 @@ export default function App() {
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6] z-40 text-center p-6 font-sans">
             <AlertCircle className="w-14 h-14 text-red-600/60 mb-4" />
             <h3 className="font-serif font-normal text-lg text-ink-dark mb-1">
-              {shouldShowWeReadOnboardingError ? "需要添加微信读书skill api" : "读书数据获取失败"}
+              数据暂时不可用
             </h3>
             <p className="text-xs text-[#2C2C26]/70 max-w-sm leading-relaxed mb-6 font-sans">
-              {shouldShowWeReadOnboardingError
-                ? "前往微信读书右上角设置，找到微信读书skill，找到快速配置2:将api复制到本网页右上角弹窗的API密钥中（注意 API 不要透露给任何人，本网站也不会存储）"
-                : error}
+              {error}
             </p>
             <button
               onClick={() => loadData(mode)}
               className="px-4 py-2 bg-[#2C2C26] hover:bg-[#2C2C26]/90 text-white text-xs tracking-wider font-sans rounded border border-[#2C2C26]/20 shadow-xs flex items-center gap-1.5 transition-all"
             >
               <RefreshCw className="w-3.5 h-3.5" />
-              重新尝试连接
+              重新尝试
             </button>
           </div>
         ) : (
@@ -1051,7 +1029,7 @@ export default function App() {
                           onClick={retryAnalysis}
                           disabled={analysisRetrying}
                           className="ml-1 flex items-center gap-1 px-1.5 py-0.5 rounded border border-[#2C2C26]/10 bg-white hover:bg-[#2C2C26]/5 disabled:opacity-50 text-[#2C2C26]/70 cursor-pointer pointer-events-auto"
-                          title="重新连接分析模型并生成年度阅读人格"
+                          title="重新生成年度阅读人格"
                         >
                           <RefreshCw className={`w-3 h-3 ${analysisRetrying ? "animate-spin" : ""}`} />
                           {analysisRetrying ? "分析中" : "重试"}

@@ -298,7 +298,7 @@ export default function GrowthMap({ notebooks, yearlyPersonality, isAiGenerated,
               : {
                   year,
                   title: "模型未连接",
-                  description: "点击右上角连接分析模型，添加模型后可以生成本年度阅读人格。"
+                  description: "分析服务暂未返回本年度阅读人格，可点击「重新分析」重试。"
                 };
             const yearBooks = groupedBooks[year] || [];
 

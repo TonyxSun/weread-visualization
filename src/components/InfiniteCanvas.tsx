@@ -74,8 +74,7 @@ export default function InfiniteCanvas({ children, onBlankClick }: InfiniteCanva
     if (
       target.closest("button") || 
       target.closest("input") || 
-      target.closest("a") || 
-      target.closest("#settings-panel")
+      target.closest("a")
     ) {
       return; 
     }
@@ -129,7 +128,6 @@ export default function InfiniteCanvas({ children, onBlankClick }: InfiniteCanva
       target.closest("textarea") ||
       target.closest("select") ||
       target.closest("a") ||
-      target.closest("#settings-panel") ||
       target.closest("#obsidian-importer-panel")
     ) {
       movedDuringDrag.current = false;
