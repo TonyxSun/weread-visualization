@@ -26,6 +26,33 @@ export interface SyncStatusResponse {
   error?: string;
 }
 
+/**
+ * Mark sync_runs left as "running" after a process crash/restart as errored.
+ * Without this, startSync coalesces onto a dead row and clients poll forever.
+ */
+export function abandonOrphanedSyncRuns(reason = "同步进程已中断，将重新开始"): number {
+  const db = getDb();
+  const orphans = db.prepare(`
+    SELECT id FROM sync_runs WHERE status = 'running'
+  `).all() as Array<{ id: number }>;
+
+  let abandoned = 0;
+  const now = Date.now();
+  for (const row of orphans) {
+    if (activeJobs.has(row.id)) continue;
+    db.prepare(`
+      UPDATE sync_runs
+      SET status = 'error', error = ?, finished_at = ?
+      WHERE id = ? AND status = 'running'
+    `).run(reason, now, row.id);
+    abandoned += 1;
+  }
+  if (abandoned > 0) {
+    console.warn(`[weread-sync] Abandoned ${abandoned} orphaned running sync run(s)`);
+  }
+  return abandoned;
+}
+
 export function startSync(
   account: AccountRow,
   creds: WeReadCredentials,
@@ -34,19 +61,31 @@ export function startSync(
   const db = getDb();
   onAuthenticatedRequest(account.id, creds);
 
+  // Drop dead "running" rows from prior process lifetimes before coalescing.
+  abandonOrphanedSyncRuns();
+
   const running = db.prepare(`
     SELECT id, mode FROM sync_runs
     WHERE account_id = ? AND status = 'running'
     ORDER BY id DESC LIMIT 1
   `).get(account.id) as { id: number; mode: string } | undefined;
 
-  if (running) {
+  if (running && activeJobs.has(running.id)) {
     return {
       syncRunId: running.id,
       status: "running",
       mode: running.mode,
       coalesced: true
     };
+  }
+
+  if (running && !activeJobs.has(running.id)) {
+    // Race-safe: another request may have just inserted; if still not active, kill it.
+    db.prepare(`
+      UPDATE sync_runs
+      SET status = 'error', error = ?, finished_at = ?
+      WHERE id = ? AND status = 'running'
+    `).run("同步任务已失效（服务重启或异常退出）", Date.now(), running.id);
   }
 
   const hasNotebooks = db.prepare(

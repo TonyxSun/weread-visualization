@@ -16,6 +16,7 @@ import dotenv from "dotenv";
 import { openDatabase } from "./server/db.ts";
 import { registerWeReadSyncRoutes } from "./server/syncRoutes.ts";
 import { startRefreshScheduler } from "./server/sync/scheduler.ts";
+import { abandonOrphanedSyncRuns } from "./server/sync/orchestrator.ts";
 
 // Node may prefer IPv6; WeRead gateway is reliably reachable over IPv4 on many networks.
 dns.setDefaultResultOrder("ipv4first");
@@ -937,6 +938,8 @@ function generateLocalThematicAnalysis(books: any[], highlights: any[]) {
 
 if (WEREAD_SERVER_SYNC_ENABLED) {
   registerWeReadSyncRoutes(app);
+  // Clear rows left "running" from a previous process so clients don't poll forever.
+  abandonOrphanedSyncRuns();
   startRefreshScheduler();
   console.log("[weread] Server-side SQLite sync enabled (POST /api/weread/snapshot, /sync)");
 }
