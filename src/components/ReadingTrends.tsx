@@ -163,8 +163,10 @@ export default function ReadingTrends({ notebooks, stats, highlights, onReanalyz
       activeYears.add(anchorDate.getFullYear());
     }
 
-    const minYear = Math.min(...activeYears);
     const maxYear = Math.max(...activeYears);
+    // Only show the most recent 6 calendar years on the contribution heatmap.
+    const HEATMAP_YEAR_WINDOW = 6;
+    const minYear = Math.max(Math.min(...activeYears), maxYear - (HEATMAP_YEAR_WINDOW - 1));
 
     return Array.from({ length: maxYear - minYear + 1 }, (_, idx) => maxYear - idx).map((year) => {
       const yearEnd = year === maxYear
@@ -535,7 +537,7 @@ export default function ReadingTrends({ notebooks, stats, highlights, onReanalyz
               阅读日历热力图
             </h3>
             <span className="text-[9px] font-mono text-slate-400">
-              {heatmapData.length > 0 ? `${heatmapData[heatmapData.length - 1].year} - ${heatmapData[0].year} 全部记录` : "暂无记录"}
+              {heatmapData.length > 0 ? `${heatmapData[heatmapData.length - 1].year} – ${heatmapData[0].year} · 近6年` : "暂无记录"}
             </span>
           </div>
 
