@@ -718,53 +718,64 @@ export default function App() {
     <div className="w-screen h-screen flex flex-col font-sans text-ink-dark bg-[#FAF9F6]">
       
       {/* Top Desk Bar */}
-      <header className="h-14 border-b border-[#2C2C26]/10 bg-white/40 backdrop-blur-md flex items-center justify-between px-6 z-[120] shadow-2xs flex-shrink-0">
-        <div className="flex items-center gap-5">
-          <div className="flex flex-col">
-            <h1 className="font-serif font-normal text-sm md:text-base tracking-tight text-[#2C2C26] flex items-center gap-1.5 leading-none">
+      <header className="h-14 border-b border-[#2C2C26]/10 bg-white/40 backdrop-blur-md flex items-center justify-between gap-2 px-3 sm:px-6 z-[120] shadow-2xs flex-shrink-0">
+        <div className="flex min-w-0 items-center gap-3 sm:gap-5">
+          <div className="flex min-w-0 flex-col">
+            <h1 className="font-serif font-normal text-sm md:text-base tracking-tight text-[#2C2C26] flex items-center gap-1.5 leading-none truncate">
               我的阅读数据图谱
             </h1>
-            <p className="text-[9px] text-[#2C2C26]/45 uppercase tracking-widest font-sans mt-0.5">
+            <p className="hidden sm:block text-[9px] text-[#2C2C26]/45 uppercase tracking-widest font-sans mt-0.5">
               Insights Interface
             </p>
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
+        <div className="flex flex-shrink-0 items-center gap-2 sm:gap-3">
+          {/* Mobile: canvas vs cards — must fully hide the other pane (see main layout below). */}
+          <div
+            className="flex items-center rounded-lg bg-[#2C2C26]/5 p-0.5 text-xs sm:hidden"
+            role="tablist"
+            aria-label="视图切换"
+          >
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "canvas"}
+              onClick={() => setTab("canvas")}
+              className={`px-2.5 py-1.5 rounded-md transition-all font-sans text-[10px] font-medium tracking-wide cursor-pointer ${
+                tab === "canvas" ? "bg-white text-ink-dark shadow-xs" : "text-[#2C2C26]/60"
+              }`}
+            >
+              图谱
+            </button>
+            <button
+              type="button"
+              role="tab"
+              aria-selected={tab === "swiper"}
+              onClick={() => setTab("swiper")}
+              className={`px-2.5 py-1.5 rounded-md transition-all font-sans text-[10px] font-medium tracking-wide cursor-pointer ${
+                tab === "swiper" ? "bg-white text-ink-dark shadow-xs" : "text-[#2C2C26]/60"
+              }`}
+            >
+              划线
+            </button>
+          </div>
+
           <button
+            type="button"
             onClick={() => loadData({ force: true })}
             disabled={loading}
-            className="flex items-center gap-2 px-3 py-2 bg-white hover:bg-[#2C2C26]/5 text-[#2C2C26] border border-[#2C2C26]/10 rounded-md shadow-sm font-sans text-xs transition-all duration-300 cursor-pointer disabled:opacity-50"
+            className="flex items-center gap-2 px-2.5 sm:px-3 py-2 bg-white hover:bg-[#2C2C26]/5 text-[#2C2C26] border border-[#2C2C26]/10 rounded-md shadow-sm font-sans text-xs transition-all duration-300 cursor-pointer disabled:opacity-50"
             title="拉取并更新最新划线与书籍数据"
           >
             <RefreshCw className={`w-3.5 h-3.5 ${loading ? "animate-spin" : ""}`} />
             <span className="hidden sm:inline">{loading ? "同步中..." : "同步数据"}</span>
           </button>
-
-          {/* Tab selectors for small screens */}
-          <div className="flex items-center rounded-lg bg-[#2C2C26]/5 p-1 text-xs sm:hidden">
-            <button
-              onClick={() => setTab("canvas")}
-              className={`px-3 py-1 rounded-md transition-all font-sans text-[10px] font-medium tracking-wider uppercase ${
-                tab === "canvas" ? "bg-white text-ink-dark shadow-xs" : "text-[#2C2C26]/60"
-              }`}
-            >
-              🎨 无限图谱
-            </button>
-            <button
-              onClick={() => setTab("swiper")}
-              className={`px-3 py-1 rounded-md transition-all font-sans text-[10px] font-medium tracking-wider uppercase ${
-                tab === "swiper" ? "bg-white text-ink-dark shadow-xs" : "text-[#2C2C26]/60"
-              }`}
-            >
-              📱 随感划线
-            </button>
-          </div>
         </div>
       </header>
 
       {/* Main split work space */}
-      <div className="flex-1 flex overflow-hidden relative bg-[#FAF9F6]">
+      <div className="flex-1 flex min-h-0 overflow-hidden relative bg-[#FAF9F6]">
         
         {error ? (
           <div className="absolute inset-0 flex flex-col items-center justify-center bg-[#FAF9F6] z-40 text-center p-6 font-sans">
@@ -803,8 +814,14 @@ export default function App() {
             )}
             {(!loading || indexingProgress?.backgroundSync) && (
           <>
-            {/* LEFT STAGE: Infinite Canvas featuring three detailed maps */}
-            <div className={`flex-1 h-full relative ${tab === "canvas" ? "block" : "hidden sm:block"}`}>
+            {/* LEFT STAGE: Infinite Canvas — full pane on mobile when tab=canvas */}
+            <div
+              className={`relative min-h-0 ${
+                tab === "canvas"
+                  ? "flex flex-1 flex-col h-full"
+                  : "hidden sm:block sm:flex-1 sm:h-full"
+              }`}
+            >
                 <InfiniteCanvas onBlankClick={() => setSelectedBookId(null)}>
                   
                   {/* Floating source indicator in canvas - left-aligned with content blocks at left 100px */}
@@ -919,14 +936,14 @@ export default function App() {
               </div>
             </div>
 
-            {/* RIGHT STAGE: Book highlights card swiper feed. Fixed on desktop for fluid experience */}
-            <div 
-              className={`border-[#2C2C26]/10 bg-white/40 flex flex-col items-center justify-center relative flex-shrink-0 z-20 transition-all duration-300 ease-in-out border-l ${
-                tab === "swiper" 
-                  ? "w-full flex" 
-                  : (rightPanelCollapsed 
-                      ? "w-0 border-l-0 overflow-hidden hidden sm:flex" 
-                      : "w-full sm:w-[410px] flex sm:flex")
+            {/* RIGHT STAGE: cards — on mobile ONLY when tab=swiper (was always w-full and crushed the canvas) */}
+            <div
+              className={`border-[#2C2C26]/10 bg-white/40 flex-col items-center justify-center relative flex-shrink-0 z-20 transition-all duration-300 ease-in-out border-l min-h-0 ${
+                tab === "swiper"
+                  ? "flex w-full flex-1 h-full"
+                  : rightPanelCollapsed
+                    ? "hidden sm:flex w-0 border-l-0 overflow-hidden"
+                    : "hidden sm:flex sm:w-[410px]"
               }`}
             >
               

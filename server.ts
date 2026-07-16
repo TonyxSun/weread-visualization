@@ -139,7 +139,7 @@ function getGeminiClient(): GoogleGenAI | null {
 // XAI_API_KEY is recognized and sets sensible xAI Responses API defaults (matches the /v1/responses curl format).
 const SERVER_ANALYSIS_API_KEY = process.env.ANALYSIS_API_KEY || process.env.XAI_API_KEY || "";
 const SERVER_ANALYSIS_API_ENDPOINT = process.env.ANALYSIS_API_ENDPOINT || (process.env.XAI_API_KEY ? "https://api.x.ai/v1/responses" : "");
-const SERVER_ANALYSIS_API_MODEL = process.env.ANALYSIS_API_MODEL || (process.env.XAI_API_KEY ? "grok-4.3" : "");
+const SERVER_ANALYSIS_API_MODEL = process.env.ANALYSIS_API_MODEL || (process.env.XAI_API_KEY ? "grok-4-5" : "");
 
 function isConcreteSecret(value?: string): boolean {
   // Keep EXACTLY in sync with src/api.ts:isConcreteSecret + stripShellValue (dupe risk noted in review).

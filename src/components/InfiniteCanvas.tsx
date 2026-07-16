@@ -236,10 +236,10 @@ export default function InfiniteCanvas({ children, onBlankClick }: InfiniteCanva
       }}
     >
       {/* Top Banner Guidelines */}
-      <div className="absolute top-4 left-6 z-10 pointer-events-none font-sans text-xs text-[#2C2C26]/60 select-none flex items-center gap-2">
-        <div className="flex items-center gap-1.5 px-2.5 py-1 bg-white/70 backdrop-blur-md border border-[#2C2C26]/10 rounded shadow-3xs">
-          <Move className="w-3.5 h-3.5" />
-          <span>拖拽鼠标进行画布平移，滚轮或右下侧缩放</span>
+      <div className="absolute top-4 left-3 right-3 sm:left-6 sm:right-auto z-10 pointer-events-none font-sans text-xs text-[#2C2C26]/60 select-none flex items-center gap-2">
+        <div className="flex items-center gap-1.5 px-2.5 py-1 bg-white/70 backdrop-blur-md border border-[#2C2C26]/10 rounded shadow-3xs max-w-full">
+          <Move className="w-3.5 h-3.5 flex-shrink-0" />
+          <span className="truncate">拖拽平移 · 双指缩放</span>
         </div>
       </div>
 
