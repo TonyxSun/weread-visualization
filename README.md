@@ -3,107 +3,120 @@
 
 # Read Visualization
 
-一个用于整理和可视化个人阅读痕迹的 React 应用。它从微信读书网关导入阅读数据，并把书籍、划线、分类、年度阅读人格和思想聚类呈现在可交互的画布中。
+个人微信读书可视化站点：从微信读书 Agent 网关拉取书架、划线与阅读统计，在无限画布与金句卡片中呈现阅读人格、分类关系与时间趋势。
+
+**发布模式：** 密钥与模型只在服务端配置。访客无法在页面上填写 API Key 或切换模型。适合挂在个人域名（例如 Railway + Cloudflare 子域名）作为作品页。
 
 ## 功能
 
-- 微信读书数据导入：拉取阅读统计、书架笔记、划线和书籍封面。
-- 无限画布：拖拽、缩放、查看书籍卡片、分类关系和阅读轨迹。
-- 年度阅读人格：根据书籍与划线生成年度 MBTI、年度问题、视觉人格和说明文本。
-- 多模型分析配置：支持兼容 OpenAI Responses、Chat Completions、Anthropic Messages、DeepSeek、Kimi、火山方舟等接口格式。
-- 本地缓存：阅读数据、分析结果和连接配置保存在浏览器本地。
-- **服务端持久化（可选）**：SQLite 本地库 + 增量同步，刷新后秒开画布，后台补全划线。
+- **微信读书同步**：服务端 SQLite 缓存 + 增量同步；刷新后先展示库内数据，后台补全划线。
+- **无限画布**：阅读成长馆、趋势面板、关系轨迹、认知景观（拖拽 / 缩放）。
+- **年度阅读人格**：服务端调用分析模型（默认 xAI `grok-4-5`）生成 MBTI、年度问题与说明；打开页面后自动分析。
+- **金句卡片**：多种卡片样式；仅展示能在当前样式中**完整排版**的划线（过长摘录自动跳过）。
+- **阅读日历热力图**：贡献图样式，**仅显示最近 6 个自然年**。
+- **移动端**：顶栏 **图谱 / 划线** 切换全屏画布与卡片视图。
 
 ## 架构概览
 
-应用由 **Express** 同时提供 API 与（开发模式下）**Vite** 前端。微信读书相关请求经 `/api/weread/proxy` 转发到网关；自 `WEREAD_SERVER_SYNC=1` 起，阅读数据优先走 **服务端 SQLite 缓存**，而不是每次刷新都从浏览器拉全量。
+**Express** 同时提供 API 与静态前端（生产）或 Vite 中间件（开发）。微信读书请求经服务端代理；默认 `WEREAD_SERVER_SYNC=1` 时，浏览器只调 snapshot/sync，不持有网关 Token。
 
 ```
 浏览器 (React)
-  │  POST /api/weread/snapshot   ← 从 data/weread.db 组装，无网关 I/O（目标 <100ms）
-  │  POST /api/weread/sync       ← 后台增量同步（202，可合并重复请求）
-  │  GET  /api/weread/sync/status ← 轮询进度（catalog → stats → highlights → backfill）
+  │  POST /api/weread/snapshot   ← 从 data/weread.db 组装
+  │  POST /api/weread/sync       ← 后台增量同步（202）
+  │  GET  /api/weread/sync/status
+  │  POST /api/weread/analyze    ← 服务端模型（XAI / ANALYSIS_* / GEMINI）
   ▼
 Express (server.ts + server/sync/*)
-  │  SyncOrchestrator（每账号单任务互斥）
-  │  wereadGateway（并发 2、间隔 400ms、最多 6 次重试，与 src/api.ts 一致）
+  │  SyncOrchestrator · wereadGateway（限流 / 重试）
   ▼
-SQLite (data/weread.db, WAL)
-  accounts · notebooks · highlights · book_notes_sync · sync_runs · stats_cache
+SQLite (data/weread.db)
   ▼
-WeRead Agent Gateway (/user/notebooks, /book/bookmarklist, /readdata/detail, …)
+WeRead Agent Gateway
 ```
 
 ### 同步策略（增量）
 
 | 数据 | 接口 | 策略 |
 |------|------|------|
-| 书架目录 | `/user/notebooks` | `lastSort` 游标分页；按 `sort` + 笔记计数做指纹，**仅变更的书**拉划线 |
-| 划线 | `/book/bookmarklist` | 默认全书 **全量替换**；可选 `WEREAD_BOOKMARKLIST_INCREMENTAL=1`（需网关验证） |
-| 阅读统计 | `/readdata/detail` | `stats_cache` 表，TTL **20 分钟**（与定时刷新一致） |
-| 补全 | — | `book_notes_sync.sync_status != ok` 的书在后台继续拉取 |
+| 书架目录 | `/user/notebooks` | 游标分页；指纹变更的书才拉划线 |
+| 划线 | `/book/bookmarklist` | 默认全书全量替换 |
+| 阅读统计 | `/readdata/detail` | `stats_cache`，TTL 约 20 分钟 |
+| 补全 | — | 未成功的书后台继续拉取 |
 
-**用户体验：** 首次或冷库仍可能较慢；**第二次打开**先展示库内数据（stale-while-revalidate），顶部半透明进度条显示后台同步。AI 人格分析仍只存在 **浏览器 localStorage**，不入库。
+首次冷库可能较慢；之后 stale-while-revalidate。AI 分析结果缓存在**浏览器 localStorage**，不入库。
 
-### 账号与后台刷新
-
-- 账号以 `SHA-256(apiKey)` 标识，库内不存明文 Token。
-- 定时器每 60s 检查，超过 20 分钟未同步则触发 `POST /sync` 等价任务。
-- 后台刷新凭证：`WEREAD_API_KEY` 环境变量（单用户），和/或 `SERVER_SECRET` + 加密存库的 key（多账号/无浏览器时）。
-
-### 部署注意
-
-- **需要** 长期运行的 Node 进程与可写 `data/` 目录：`npm run dev` / `npm run start`。
-- **Netlify 静态发布**（仅 `dist/`）无法使用服务端同步；可设 `WEREAD_SERVER_SYNC=0` 回退为纯浏览器冷同步。
-- **发布到个人站点时**：密钥与模型只在服务端配置。前端不再提供 API Key / 分析模型设置面板；访客无法在页面上填写或保存密钥。
-
-更完整的设计说明见 [`docs/design-server-sync-cache.md`](docs/design-server-sync-cache.md)。
+更完整的同步设计见 [`docs/design-server-sync-cache.md`](docs/design-server-sync-cache.md)。
 
 ## 技术栈
 
-- React 19
-- TypeScript
-- Vite
-- Express
-- Tailwind CSS
-- Motion
-- Lucide React
-- better-sqlite3（服务端阅读数据缓存）
+React 19 · TypeScript · Vite · Express · Tailwind CSS · Motion · Lucide · better-sqlite3
 
 ## 本地运行
 
 ```bash
 npm install
+cp .env.example .env   # 填入 WEREAD_API_KEY 等
 npm run dev
 ```
 
-默认服务地址为 `http://localhost:3000`。
+默认：http://localhost:3000
 
-复制 `.env.example` 为 `.env`，**仅在服务端**配置：
+### 环境变量（仅服务端）
 
 | 变量 | 说明 |
 |------|------|
-| `WEREAD_API_KEY` | **必需**（发布模式）。微信读书网关 Token；服务端代理、SQLite 同步与定时刷新均只读此环境变量。 |
+| `WEREAD_API_KEY` | **必需**。微信读书网关 Token |
 | `WEREAD_API_URL` | 网关地址（默认官方 Agent Gateway） |
-| `WEREAD_SERVER_SYNC` | `1` 启用 SQLite 缓存（默认）；`0` 仅用浏览器经服务端代理拉取 |
-| `SERVER_SECRET` | 可选，32+ 字符，用于加密存储 API Key 以支持无浏览器定时刷新 |
-| `XAI_API_KEY` / `ANALYSIS_API_KEY` + `ANALYSIS_API_ENDPOINT` / `ANALYSIS_API_MODEL` | 可选，服务端 AI 分析（xAI / OpenAI-compatible 等） |
-| `GEMINI_API_KEY` | 可选，服务端 Gemini 分析后备 |
+| `WEREAD_SERVER_SYNC` | `1`（默认）SQLite 缓存；`0` 关闭 |
+| `XAI_API_KEY` | 可选。xAI 分析；默认 endpoint + 模型 **`grok-4-5`** |
+| `ANALYSIS_API_KEY` / `ANALYSIS_API_ENDPOINT` / `ANALYSIS_API_MODEL` | 可选。覆盖通用分析提供方 |
+| `GEMINI_API_KEY` | 可选。Gemini 后备 |
+| `SERVER_SECRET` | 可选。加密存库 key（多账号 / 定时刷新） |
+| `APP_URL` | 可选。站点公网 URL |
+| `PORT` | 监听端口（Railway 等平台会注入） |
 
-发布模式不在浏览器保存密钥；页面上的「分析模型」标签为只读状态（来自服务端或本地语义分析结果）。
+示例见 [`.env.example`](.env.example)。**不要**把真实密钥提交进仓库。
+
+## 部署
+
+需要**长期运行的 Node 进程**和可写的 `data/`（SQLite）：
+
+```bash
+npm run build
+npm start          # node dist/server.cjs
+```
+
+| 场景 | 说明 |
+|------|------|
+| **Railway / Fly / VPS** | 推荐。挂 volume 到 `data/`，在面板配置上表环境变量 |
+| **自定义域名** | 在宿主添加域名后，于 DNS（如 Cloudflare）配置 CNAME + 验证 TXT；代理模式 SSL 用 Full / Full (strict) |
+| **Netlify 纯静态** | 无 SQLite 长连接；需 `WEREAD_SERVER_SYNC=0` 与 serverless 代理，体验弱于 Node 部署 |
+
+部署后自检：
+
+```bash
+curl -s https://your-host/api/weread/status
+# → {"hasServerWereadKey":true}
+
+curl -s https://your-host/api/analysis/status
+# → hasServerAnalysisKey + serverModel（若配置了 XAI/ANALYSIS）
+```
 
 ## 常用命令
 
 ```bash
-npm run dev      # 启动开发服务
-npm run build    # 构建前端和服务端产物
-npm run start    # 运行构建后的服务
-npm run lint     # TypeScript 类型检查
-npm run verify:publish  # 发布模式静态检查 + 无客户端密钥请求路径
+npm run dev                 # 开发
+npm run build               # 构建前端 + 服务端
+npm run start               # 生产启动
+npm run lint                # tsc --noEmit
+npm run verify:publish      # 发布模式：无客户端密钥 + 双次启动探测
+npm run verify:card-excerpts  # 金句卡片几何过滤（含本地 DB 样本）
+npm run verify:card-dom     # Playwright：卡片 DOM 无裁切（需 playwright）
 ```
 
-## 敏感信息说明
+## 敏感信息
 
-- `.env*` 默认被忽略，只有 `.env.example` 会进入版本库。
-- `dist/`、`node_modules/`、日志文件和系统文件不会进入版本库。
-- 微信读书网关 Token、第三方模型 API Key 等信息只应保存在**服务端私有环境变量**中，不要写进前端或提交到仓库。
+- 仅 `.env.example` 进库；真实 `.env` / 平台 Secret 不进 Git。
+- 微信读书 Token、模型 API Key 只放服务端。
+- 前端请求 snapshot/sync/analyze **不携带访客密钥**。
