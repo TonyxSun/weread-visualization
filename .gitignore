@@ -8,3 +8,6 @@ coverage/
 .env*
 !.env.example
 data/
+public/
+.vercel/*
+!.vercel/project.json

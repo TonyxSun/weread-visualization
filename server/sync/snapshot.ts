@@ -1,4 +1,4 @@
-import { getDb } from "../db.js";
+import { all, get } from "../db.js";
 import { REFRESH_INTERVAL_MS } from "./constants.js";
 
 export interface SnapshotMeta {
@@ -10,22 +10,46 @@ export interface SnapshotMeta {
   syncInProgress: boolean;
 }
 
-export function buildSnapshot(accountId: number): {
+export async function buildSnapshot(accountId: number): Promise<{
   notebooks: unknown[];
   stats: Record<string, unknown> | null;
   highlights: unknown[];
   meta: SnapshotMeta;
-} {
-  const db = getDb();
-  const account = db.prepare(
-    "SELECT last_sync_at FROM accounts WHERE id = ?"
-  ).get(accountId) as { last_sync_at: number | null };
-
-  const notebookRows = db.prepare(`
-    SELECT book_json FROM notebooks
-    WHERE account_id = ? AND deleted_at IS NULL
-    ORDER BY sort DESC
-  `).all(accountId) as Array<{ book_json: string }>;
+}> {
+  const [account, notebookRows, highlightRows, statsRow, pendingBooks, running] = await Promise.all([
+    get<{ last_sync_at: number | null }>(
+      "SELECT last_sync_at FROM accounts WHERE id = ?",
+      [accountId]
+    ),
+    all<{ book_json: string }>(
+      `SELECT book_json FROM notebooks
+      WHERE account_id = ? AND deleted_at IS NULL
+      ORDER BY sort DESC`,
+      [accountId]
+    ),
+    all<Record<string, unknown>>(
+      `SELECT bookmark_id, book_id, chapter_uid, chapter_idx, mark_text, create_time,
+             type, range, color_style, book_name, book_author, book_cover
+      FROM highlights WHERE account_id = ?
+      ORDER BY create_time DESC`,
+      [accountId]
+    ),
+    get<{ payload_json: string }>(
+      "SELECT payload_json FROM stats_cache WHERE account_id = ? AND mode = 'overall'",
+      [accountId]
+    ),
+    get<{ c: number }>(
+      `SELECT COUNT(*) AS c FROM book_notes_sync
+      WHERE account_id = ? AND sync_status != 'ok'`,
+      [accountId]
+    ),
+    get<{ id: number }>(
+      `SELECT id FROM sync_runs
+      WHERE account_id = ? AND status = 'running'
+      ORDER BY id DESC LIMIT 1`,
+      [accountId]
+    )
+  ]);
 
   const notebooks = notebookRows.map((row) => {
     try {
@@ -34,13 +58,6 @@ export function buildSnapshot(accountId: number): {
       return null;
     }
   }).filter(Boolean);
-
-  const highlightRows = db.prepare(`
-    SELECT bookmark_id, book_id, chapter_uid, chapter_idx, mark_text, create_time,
-           type, range, color_style, book_name, book_author, book_cover
-    FROM highlights WHERE account_id = ?
-    ORDER BY create_time DESC
-  `).all(accountId) as Array<Record<string, unknown>>;
 
   const highlights = highlightRows.map((h) => ({
     bookmarkId: h.bookmark_id,
@@ -57,10 +74,6 @@ export function buildSnapshot(accountId: number): {
     bookCover: h.book_cover
   }));
 
-  const statsRow = db.prepare(
-    "SELECT payload_json FROM stats_cache WHERE account_id = ? AND mode = 'overall'"
-  ).get(accountId) as { payload_json: string } | undefined;
-
   let stats: Record<string, unknown> | null = null;
   if (statsRow) {
     try {
@@ -70,22 +83,12 @@ export function buildSnapshot(accountId: number): {
     }
   }
 
-  const pendingBooks = db.prepare(`
-    SELECT COUNT(*) AS c FROM book_notes_sync
-    WHERE account_id = ? AND sync_status != 'ok'
-  `).get(accountId) as { c: number };
-
-  const running = db.prepare(`
-    SELECT id FROM sync_runs
-    WHERE account_id = ? AND status = 'running'
-    ORDER BY id DESC LIMIT 1
-  `).get(accountId) as { id: number } | undefined;
-
   const lastSyncAt = account?.last_sync_at ?? null;
+  const pendingCount = Number(pendingBooks?.c ?? 0);
   const stale =
     (lastSyncAt != null && Date.now() - lastSyncAt > REFRESH_INTERVAL_MS)
     || Boolean(running)
-    || pendingBooks.c > 0;
+    || pendingCount > 0;
 
   return {
     notebooks,
@@ -93,8 +96,8 @@ export function buildSnapshot(accountId: number): {
     highlights,
     meta: {
       stale,
-      partial: pendingBooks.c > 0,
-      pendingBooks: pendingBooks.c,
+      partial: pendingCount > 0,
+      pendingBooks: pendingCount,
       lastSyncAt,
       syncRunId: running?.id ?? null,
       syncInProgress: Boolean(running)

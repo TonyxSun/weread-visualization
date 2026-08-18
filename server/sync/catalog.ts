@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { getDb } from "../db.js";
+import { all, batch, type SqlValue } from "../db.js";
 import type { WeReadGateway } from "../wereadGateway.js";
 
 export interface CatalogBook {
@@ -34,7 +34,7 @@ function dedupeByBookId(books: CatalogBook[]): CatalogBook[] {
 }
 
 export async function fetchFullCatalog(gateway: WeReadGateway): Promise<CatalogBook[]> {
-  const all: CatalogBook[] = [];
+  const collected: CatalogBook[] = [];
   let lastSort: number | undefined;
   const pageSize = 100;
 
@@ -57,28 +57,32 @@ export async function fetchFullCatalog(gateway: WeReadGateway): Promise<CatalogB
         raw: row
       };
     });
-    all.push(...books);
+    collected.push(...books);
     if (!page.hasMore) break;
     const pageBooks = dedupeByBookId(books);
     if (pageBooks.length === 0) break;
     lastSort = pageBooks[pageBooks.length - 1]?.sort;
   } while (lastSort != null);
 
-  return dedupeByBookId(all);
+  return dedupeByBookId(collected);
 }
 
-export function persistCatalog(accountId: number, apiBooks: CatalogBook[]): string[] {
-  const db = getDb();
+export async function persistCatalog(accountId: number, apiBooks: CatalogBook[]): Promise<string[]> {
   const now = Date.now();
-  const existing = db.prepare(
-    "SELECT book_id, fingerprint FROM notebooks WHERE account_id = ? AND deleted_at IS NULL"
-  ).all(accountId) as Array<{ book_id: string; fingerprint: string }>;
+  const existing = await all<{ book_id: string; fingerprint: string }>(
+    "SELECT book_id, fingerprint FROM notebooks WHERE account_id = ? AND deleted_at IS NULL",
+    [accountId]
+  );
   const existingMap = new Map(existing.map((r) => [r.book_id, r.fingerprint]));
   const apiIds = new Set(apiBooks.map((b) => b.bookId));
   const toFetch: string[] = [];
+  const statements: Array<{ sql: string; args: SqlValue[] }> = [];
 
-  const upsert = db.prepare(`
-    INSERT INTO notebooks (
+  for (const book of apiBooks) {
+    const fp = notebookFingerprint(book);
+    const prev = existingMap.get(book.bookId);
+    statements.push({
+      sql: `INSERT INTO notebooks (
       account_id, book_id, sort, note_count, review_count, bookmark_count,
       marked_status, reading_progress, book_json, fingerprint, deleted_at, updated_at
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
@@ -92,42 +96,45 @@ export function persistCatalog(accountId: number, apiBooks: CatalogBook[]): stri
       book_json = excluded.book_json,
       fingerprint = excluded.fingerprint,
       deleted_at = NULL,
-      updated_at = excluded.updated_at
-  `);
-
-  for (const book of apiBooks) {
-    const fp = notebookFingerprint(book);
-    const prev = existingMap.get(book.bookId);
-    upsert.run(
-      accountId,
-      book.bookId,
-      book.sort,
-      book.noteCount,
-      book.reviewCount,
-      book.bookmarkCount,
-      book.markedStatus ?? null,
-      book.readingProgress ?? null,
-      JSON.stringify(book.raw),
-      fp,
-      now
-    );
+      updated_at = excluded.updated_at`,
+      args: [
+        accountId,
+        book.bookId,
+        book.sort,
+        book.noteCount,
+        book.reviewCount,
+        book.bookmarkCount,
+        book.markedStatus ?? null,
+        book.readingProgress ?? null,
+        JSON.stringify(book.raw),
+        fp,
+        now
+      ]
+    });
     if (!prev || prev !== fp) {
       toFetch.push(book.bookId);
-      db.prepare(`
-        INSERT INTO book_notes_sync (account_id, book_id, sync_status)
+      statements.push({
+        sql: `INSERT INTO book_notes_sync (account_id, book_id, sync_status)
         VALUES (?, ?, 'pending')
-        ON CONFLICT(account_id, book_id) DO UPDATE SET sync_status = 'pending'
-      `).run(accountId, book.bookId);
+        ON CONFLICT(account_id, book_id) DO UPDATE SET sync_status = 'pending'`,
+        args: [accountId, book.bookId]
+      });
     }
   }
 
   for (const row of existing) {
     if (!apiIds.has(row.book_id)) {
-      db.prepare("UPDATE notebooks SET deleted_at = ?, updated_at = ? WHERE account_id = ? AND book_id = ?")
-        .run(now, now, accountId, row.book_id);
-      db.prepare("DELETE FROM highlights WHERE account_id = ? AND book_id = ?").run(accountId, row.book_id);
+      statements.push({
+        sql: "UPDATE notebooks SET deleted_at = ?, updated_at = ? WHERE account_id = ? AND book_id = ?",
+        args: [now, now, accountId, row.book_id]
+      });
+      statements.push({
+        sql: "DELETE FROM highlights WHERE account_id = ? AND book_id = ?",
+        args: [accountId, row.book_id]
+      });
     }
   }
 
+  await batch(statements);
   return toFetch;
 }

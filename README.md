@@ -5,7 +5,7 @@
 
 个人微信读书可视化站点：从微信读书 Agent 网关拉取书架、划线与阅读统计，在无限画布与金句卡片中呈现阅读人格、分类关系与时间趋势。
 
-**发布模式：** 密钥与模型只在服务端配置。访客无法在页面上填写 API Key 或切换模型。适合挂在个人域名（例如 Railway + Cloudflare 子域名）作为作品页。
+**发布模式：** 密钥与模型只在服务端配置。访客无法在页面上填写 API Key 或切换模型。适合挂在个人域名（例如 Vercel + Cloudflare 子域名）作为作品页。
 
 ## 功能
 
@@ -30,7 +30,7 @@
 Express (server.ts + server/sync/*)
   │  SyncOrchestrator · wereadGateway（限流 / 重试）
   ▼
-SQLite (data/weread.db)
+SQLite（本地 `data/weread.db` 或 Vercel 上的 Turso / libSQL）
   ▼
 WeRead Agent Gateway
 ```
@@ -50,7 +50,7 @@ WeRead Agent Gateway
 
 ## 技术栈
 
-React 19 · TypeScript · Vite · Express · Tailwind CSS · Motion · Lucide · better-sqlite3
+React 19 · TypeScript · Vite · Express · Tailwind CSS · Motion · Lucide · libSQL / Turso
 
 ## 本地运行
 
@@ -69,29 +69,44 @@ npm run dev
 | `WEREAD_API_KEY` | **必需**。微信读书网关 Token |
 | `WEREAD_API_URL` | 网关地址（默认官方 Agent Gateway） |
 | `WEREAD_SERVER_SYNC` | `1`（默认）SQLite 缓存；`0` 关闭 |
+| `TURSO_DATABASE_URL` | **Vercel 必需**。Turso / libSQL 远程库 URL |
+| `TURSO_AUTH_TOKEN` | **Vercel 必需**。Turso 鉴权 token |
+| `CRON_SECRET` | 可选。保护 `GET /api/weread/cron`（Vercel Cron 会自动带上） |
 | `XAI_API_KEY` | 可选。xAI 分析；默认 endpoint + 模型 **`grok-4-5`** |
 | `ANALYSIS_API_KEY` / `ANALYSIS_API_ENDPOINT` / `ANALYSIS_API_MODEL` | 可选。覆盖通用分析提供方 |
 | `GEMINI_API_KEY` | 可选。Gemini 后备 |
 | `SERVER_SECRET` | 可选。加密存库 key（多账号 / 定时刷新） |
 | `APP_URL` | 可选。站点公网 URL |
-| `PORT` | 监听端口（Railway 等平台会注入） |
+| `PORT` | 本地监听端口（Vercel 不使用） |
 
 示例见 [`.env.example`](.env.example)。**不要**把真实密钥提交进仓库。
 
 ## 部署
 
-需要**长期运行的 Node 进程**和可写的 `data/`（SQLite）：
+需要可持久化的 SQLite（本地文件或 Turso）以及 Node 服务端。
+
+**Vercel：** 构建前端，由 `server.ts` 提供 API 与 SPA。Vercel 磁盘不可持久化，生产必须配置 Turso。
+
+```bash
+npx vercel link --yes --project weread --scope tonyxsuns-projects
+npx vercel env add WEREAD_API_KEY
+npx vercel env add TURSO_DATABASE_URL
+npx vercel env add TURSO_AUTH_TOKEN
+npx vercel --prod
+```
+
+本地生产模式：
 
 ```bash
 npm run build
-npm start          # node dist/server.cjs
+npm start
 ```
 
 | 场景 | 说明 |
 |------|------|
-| **Railway / Fly / VPS** | 推荐。挂 volume 到 `data/`，在面板配置上表环境变量 |
-| **自定义域名** | 在宿主添加域名后，于 DNS（如 Cloudflare）配置 CNAME + 验证 TXT；代理模式 SSL 用 Full / Full (strict) |
-| **Netlify 纯静态** | 无 SQLite 长连接；需 `WEREAD_SERVER_SYNC=0` 与 serverless 代理，体验弱于 Node 部署 |
+| **Vercel（推荐）** | Express 入口 `server.ts`；Turso 存库；Hobby 每天一次 Cron（`GET /api/weread/cron`）。Pro 可把 `vercel.json` 的 schedule 改成 `*/20 * * * *` |
+| **自定义域名** | 在 Vercel 添加域名，于 DNS（如 Cloudflare）配置 CNAME；Cloudflare 代理 SSL 用 Full / Full (strict) |
+| **本地 / VPS** | 无 `TURSO_DATABASE_URL` 时写入 `data/weread.db` |
 
 部署后自检：
 
@@ -107,7 +122,7 @@ curl -s https://your-host/api/analysis/status
 
 ```bash
 npm run dev                 # 开发
-npm run build               # 构建前端 + 服务端
+npm run build               # 构建前端
 npm run start               # 生产启动
 npm run lint                # tsc --noEmit
 npm run verify:publish      # 发布模式：无客户端密钥 + 双次启动探测

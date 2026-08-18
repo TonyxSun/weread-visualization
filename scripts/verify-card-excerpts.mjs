@@ -15,7 +15,7 @@ import {
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
-import Database from "better-sqlite3";
+import { createClient } from "@libsql/client";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(__dirname, "..");
@@ -70,8 +70,9 @@ assert(maxLinesForBox(tinyBox) === 2, "maxLines floors height/linePx"); // 48/(1
 // ── Real DB highlights (if present) ──────────────────────────────────────────
 const dbPath = path.join(root, "data", "weread.db");
 if (fs.existsSync(dbPath)) {
-  const db = new Database(dbPath, { readonly: true });
-  const rows = db.prepare("SELECT mark_text AS markText FROM highlights").all();
+  const db = createClient({ url: `file:${dbPath}` });
+  const rs = await db.execute("SELECT mark_text AS markText FROM highlights");
+  const rows = rs.rows.map((row) => ({ markText: String(row.markText ?? "") }));
   assert(rows.length > 0, `db has ${rows.length} highlights`);
 
   for (const style of Object.keys(CARD_QUOTE_BOXES)) {

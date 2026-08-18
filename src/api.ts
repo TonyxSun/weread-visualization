@@ -35,7 +35,7 @@ export const DEFAULT_ANALYSIS_API_ENDPOINT = "https://ark.cn-beijing.volces.com/
 export const DEFAULT_ANALYSIS_MODEL = "本地语义分析";
 
 /** Server SQLite sync enabled unless explicitly WEREAD_SERVER_SYNC=0 */
-export const SERVER_SYNC_ENABLED = import.meta.env.WEREAD_SERVER_SYNC !== "0";
+export const SERVER_SYNC_ENABLED = import.meta.env.VITE_WEREAD_SERVER_SYNC !== "0";
 
 export interface WeReadSnapshotMeta {
   stale: boolean;
@@ -183,7 +183,7 @@ function stripShellValue(value: string): string {
 
 function envWeReadGatewayUrl(): string {
   try {
-    const value = import.meta.env?.WEREAD_API_URL;
+    const value = import.meta.env?.VITE_WEREAD_API_URL;
     const cleaned = value ? stripShellValue(String(value)) : "";
     return cleaned || DEFAULT_GATEWAY_URL;
   } catch {
