@@ -1,6 +1,6 @@
 import crypto from "crypto";
 import { hashApiKey, type AccountRow } from "../account.js";
-import { getDb } from "../db.js";
+import { run } from "../db.js";
 import { REFRESH_INTERVAL_MS } from "./constants.js";
 import type { WeReadCredentials } from "../wereadGateway.js";
 
@@ -15,25 +15,31 @@ export function encryptApiKey(apiKey: string, secret: string): Buffer {
   return Buffer.concat([iv, tag, enc]);
 }
 
-export function decryptApiKey(blob: Buffer, secret: string): string {
+export function decryptApiKey(blob: Uint8Array | Buffer, secret: string): string {
+  const buf = Buffer.isBuffer(blob) ? blob : Buffer.from(blob);
   const key = crypto.createHash("sha256").update(secret).digest();
-  const iv = blob.subarray(0, 12);
-  const tag = blob.subarray(12, 28);
-  const data = blob.subarray(28);
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const data = buf.subarray(28);
   const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
 }
 
-export function onAuthenticatedRequest(accountId: number, creds: WeReadCredentials): void {
+export async function onAuthenticatedRequest(
+  accountId: number,
+  creds: WeReadCredentials
+): Promise<void> {
   credentialCache.set(accountId, {
     ...creds,
     expiresAt: Date.now() + REFRESH_INTERVAL_MS + 300_000
   });
   const secret = process.env.SERVER_SECRET;
   if (!secret || secret.length < 16) return;
-  getDb().prepare("UPDATE accounts SET api_key_encrypted = ?, updated_at = ? WHERE id = ?")
-    .run(encryptApiKey(creds.apiKey, secret), Date.now(), accountId);
+  await run(
+    "UPDATE accounts SET api_key_encrypted = ?, updated_at = ? WHERE id = ?",
+    [encryptApiKey(creds.apiKey, secret), Date.now(), accountId]
+  );
 }
 
 export function resolveSchedulerCredentials(account: AccountRow): WeReadCredentials | null {

@@ -1,5 +1,5 @@
 import crypto from "crypto";
-import { getDb } from "./db.js";
+import { get, run, type SqlValue } from "./db.js";
 
 export function hashApiKey(apiKey: string): string {
   return crypto.createHash("sha256").update(apiKey.trim()).digest("hex");
@@ -13,61 +13,50 @@ export interface AccountRow {
   catalog_refresh_count: number;
   last_sync_at: number | null;
   last_snapshot_at: number | null;
-  api_key_encrypted: Buffer | null;
+  api_key_encrypted: Uint8Array | Buffer | null;
 }
 
-export function upsertAccount(params: {
+export async function upsertAccount(params: {
   apiKey: string;
   gatewayUrl: string;
   skillVersion: string;
-  apiKeyEncrypted?: Buffer | null;
-}): AccountRow {
-  const db = getDb();
+  apiKeyEncrypted?: Uint8Array | Buffer | null;
+}): Promise<AccountRow> {
   const now = Date.now();
   const hash = hashApiKey(params.apiKey);
-  const existing = db.prepare(
-    "SELECT * FROM accounts WHERE account_key_hash = ?"
-  ).get(hash) as AccountRow | undefined;
-
-  if (existing) {
-    db.prepare(`
-      UPDATE accounts SET
-        gateway_url = ?,
-        skill_version = ?,
-        api_key_encrypted = COALESCE(?, api_key_encrypted),
-        updated_at = ?
-      WHERE id = ?
-    `).run(
-      params.gatewayUrl,
-      params.skillVersion,
-      params.apiKeyEncrypted ?? null,
-      now,
-      existing.id
-    );
-    return db.prepare("SELECT * FROM accounts WHERE id = ?").get(existing.id) as AccountRow;
-  }
-
-  const result = db.prepare(`
-    INSERT INTO accounts (
+  await run(
+    `INSERT INTO accounts (
       account_key_hash, gateway_url, skill_version, api_key_encrypted,
       catalog_refresh_count, created_at, updated_at
     ) VALUES (?, ?, ?, ?, 0, ?, ?)
-  `).run(
-    hash,
-    params.gatewayUrl,
-    params.skillVersion,
-    params.apiKeyEncrypted ?? null,
-    now,
-    now
+    ON CONFLICT(account_key_hash) DO UPDATE SET
+      gateway_url = excluded.gateway_url,
+      skill_version = excluded.skill_version,
+      api_key_encrypted = COALESCE(excluded.api_key_encrypted, accounts.api_key_encrypted),
+      updated_at = excluded.updated_at`,
+    [
+      hash,
+      params.gatewayUrl,
+      params.skillVersion,
+      (params.apiKeyEncrypted ?? null) as SqlValue,
+      now,
+      now
+    ]
   );
-
-  return db.prepare("SELECT * FROM accounts WHERE id = ?").get(result.lastInsertRowid) as AccountRow;
+  const row = await get<AccountRow>(
+    "SELECT * FROM accounts WHERE account_key_hash = ?",
+    [hash]
+  );
+  if (!row) {
+    throw new Error("Failed to upsert WeRead account");
+  }
+  return row;
 }
 
-export function getAccountByHash(hash: string): AccountRow | undefined {
-  return getDb().prepare("SELECT * FROM accounts WHERE account_key_hash = ?").get(hash) as AccountRow | undefined;
+export async function getAccountByHash(hash: string): Promise<AccountRow | undefined> {
+  return get<AccountRow>("SELECT * FROM accounts WHERE account_key_hash = ?", [hash]);
 }
 
-export function getAccountById(id: number): AccountRow | undefined {
-  return getDb().prepare("SELECT * FROM accounts WHERE id = ?").get(id) as AccountRow | undefined;
+export async function getAccountById(id: number): Promise<AccountRow | undefined> {
+  return get<AccountRow>("SELECT * FROM accounts WHERE id = ?", [id]);
 }

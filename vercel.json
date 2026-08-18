@@ -1,0 +1,23 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "express",
+  "buildCommand": "npx vite build && rm -rf public && mkdir public && cp -R dist/. public/",
+  "functions": {
+    "server.ts": {
+      "maxDuration": 300,
+      "includeFiles": "server/db/migrations/**"
+    }
+  },
+  "rewrites": [
+    {
+      "source": "/",
+      "destination": "/index.html"
+    }
+  ],
+  "crons": [
+    {
+      "path": "/api/weread/cron",
+      "schedule": "0 12 * * *"
+    }
+  ]
+}

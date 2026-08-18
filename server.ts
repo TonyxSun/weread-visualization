@@ -10,13 +10,12 @@ import type http from "http";
 import express from "express";
 import path from "path";
 import fs from "fs";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
-import { openDatabase } from "./server/db.ts";
-import { registerWeReadSyncRoutes } from "./server/syncRoutes.ts";
-import { startRefreshScheduler } from "./server/sync/scheduler.ts";
-import { abandonOrphanedSyncRuns } from "./server/sync/orchestrator.ts";
+import { ensureDb } from "./server/db.js";
+import { registerWeReadSyncRoutes } from "./server/syncRoutes.js";
+import { startRefreshScheduler } from "./server/sync/scheduler.js";
+import { abandonOrphanedSyncRuns } from "./server/sync/orchestrator.js";
 
 // Node may prefer IPv6; WeRead gateway is reliably reachable over IPv4 on many networks.
 dns.setDefaultResultOrder("ipv4first");
@@ -24,9 +23,7 @@ dns.setDefaultResultOrder("ipv4first");
 dotenv.config();
 
 const WEREAD_SERVER_SYNC_ENABLED = process.env.WEREAD_SERVER_SYNC !== "0";
-if (WEREAD_SERVER_SYNC_ENABLED) {
-  openDatabase();
-}
+const isVercel = Boolean(process.env.VERCEL);
 
 async function requestHttpsIpv4(
   targetUrl: string,
@@ -938,19 +935,40 @@ function generateLocalThematicAnalysis(books: any[], highlights: any[]) {
 
 if (WEREAD_SERVER_SYNC_ENABLED) {
   registerWeReadSyncRoutes(app);
-  // Clear rows left "running" from a previous process so clients don't poll forever.
-  abandonOrphanedSyncRuns();
-  startRefreshScheduler();
   console.log("[weread] Server-side SQLite sync enabled (POST /api/weread/snapshot, /sync)");
 }
 
-// 3. Vite Server / Production Build Handles
-// Mount Vite middleware in development, serve static in production
-const isProduction = process.env.NODE_ENV === "production";
+const isProduction = process.env.NODE_ENV === "production" || isVercel;
 const distPath = path.join(process.cwd(), "dist");
 
-async function setupServer() {
+function mountProductionStatic(): void {
+  app.use(express.static(distPath));
+  app.get("*", (req, res, next) => {
+    if (req.path.startsWith("/api/")) {
+      next();
+      return;
+    }
+    res.sendFile(path.join(distPath, "index.html"));
+  });
+}
+
+async function setupServer(): Promise<void> {
+  if (isProduction) {
+    mountProductionStatic();
+  }
+
+  if (WEREAD_SERVER_SYNC_ENABLED) {
+    try {
+      await ensureDb();
+      await abandonOrphanedSyncRuns();
+      startRefreshScheduler();
+    } catch (error) {
+      console.error("[weread] Failed to initialize database", error);
+    }
+  }
+
   if (!isProduction) {
+    const { createServer: createViteServer } = await import("vite");
     const hmrHost = process.env.VITE_HMR_HOST;
     const hmrProtocol = process.env.VITE_HMR_PROTOCOL as "ws" | "wss" | undefined;
     const hmrClientPort = process.env.VITE_HMR_CLIENT_PORT
@@ -971,16 +989,15 @@ async function setupServer() {
       appType: "spa",
     });
     app.use(vite.middlewares);
-  } else {
-    app.use(express.static(distPath));
-    app.get("*", (req, res) => {
-      res.sendFile(path.join(distPath, "index.html"));
-    });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
-    console.log(`Server running on http://localhost:${PORT}`);
-  });
+  if (!isVercel) {
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Server running on http://localhost:${PORT}`);
+    });
+  }
 }
 
-setupServer();
+await setupServer();
+
+export default app;

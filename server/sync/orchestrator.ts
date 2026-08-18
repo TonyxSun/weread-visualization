@@ -1,4 +1,5 @@
-import { getDb } from "../db.js";
+import { waitUntil } from "@vercel/functions";
+import { all, get, isUniqueConstraintError, run } from "../db.js";
 import type { AccountRow } from "../account.js";
 import { WeReadGateway, type WeReadCredentials } from "../wereadGateway.js";
 import { fetchFullCatalog, persistCatalog } from "./catalog.js";
@@ -8,6 +9,7 @@ import { FULL_REFRESH_EVERY_N } from "./constants.js";
 import { onAuthenticatedRequest } from "./credentials.js";
 
 const activeJobs = new Set<number>();
+const SYNC_ORPHAN_MS = 90_000;
 
 export interface SyncStartResponse {
   syncRunId: number;
@@ -27,24 +29,28 @@ export interface SyncStatusResponse {
 }
 
 /**
- * Mark sync_runs left as "running" after a process crash/restart as errored.
- * Without this, startSync coalesces onto a dead row and clients poll forever.
+ * Mark stale "running" rows as errored.
+ * Local process restart: drop any running row not tracked in this process.
+ * Vercel: drop rows whose heartbeat is older than SYNC_ORPHAN_MS.
  */
-export function abandonOrphanedSyncRuns(reason = "同步进程已中断，将重新开始"): number {
-  const db = getDb();
-  const orphans = db.prepare(`
-    SELECT id FROM sync_runs WHERE status = 'running'
-  `).all() as Array<{ id: number }>;
-
+export async function abandonOrphanedSyncRuns(
+  reason = "同步进程已中断，将重新开始"
+): Promise<number> {
+  const orphans = await getRunningSyncRuns();
   let abandoned = 0;
   const now = Date.now();
   for (const row of orphans) {
     if (activeJobs.has(row.id)) continue;
-    db.prepare(`
-      UPDATE sync_runs
+    const heartbeat = row.last_heartbeat_at || row.started_at;
+    const stale = now - heartbeat > SYNC_ORPHAN_MS;
+    const localRestart = !process.env.VERCEL;
+    if (!stale && !localRestart) continue;
+    await run(
+      `UPDATE sync_runs
       SET status = 'error', error = ?, finished_at = ?
-      WHERE id = ? AND status = 'running'
-    `).run(reason, now, row.id);
+      WHERE id = ? AND status = 'running'`,
+      [reason, now, row.id]
+    );
     abandoned += 1;
   }
   if (abandoned > 0) {
@@ -53,24 +59,43 @@ export function abandonOrphanedSyncRuns(reason = "同步进程已中断，将重
   return abandoned;
 }
 
-export function startSync(
+async function getRunningSyncRuns(): Promise<Array<{
+  id: number;
+  started_at: number;
+  last_heartbeat_at: number | null;
+}>> {
+  return all<{ id: number; started_at: number; last_heartbeat_at: number | null }>(
+    "SELECT id, started_at, last_heartbeat_at FROM sync_runs WHERE status = 'running'"
+  );
+}
+
+export async function startSync(
   account: AccountRow,
   creds: WeReadCredentials,
   opts: { force?: boolean } = {}
-): SyncStartResponse {
-  const db = getDb();
-  onAuthenticatedRequest(account.id, creds);
+): Promise<SyncStartResponse> {
+  await onAuthenticatedRequest(account.id, creds);
+  await abandonOrphanedSyncRuns();
 
-  // Drop dead "running" rows from prior process lifetimes before coalescing.
-  abandonOrphanedSyncRuns();
-
-  const running = db.prepare(`
-    SELECT id, mode FROM sync_runs
+  const running = await get<{
+    id: number;
+    mode: string;
+    started_at: number;
+    last_heartbeat_at: number | null;
+  }>(
+    `SELECT id, mode, started_at, last_heartbeat_at FROM sync_runs
     WHERE account_id = ? AND status = 'running'
-    ORDER BY id DESC LIMIT 1
-  `).get(account.id) as { id: number; mode: string } | undefined;
+    ORDER BY id DESC LIMIT 1`,
+    [account.id]
+  );
 
-  if (running && activeJobs.has(running.id)) {
+  const runningFresh = Boolean(
+    running && (
+      activeJobs.has(running.id)
+      || Date.now() - (running.last_heartbeat_at || running.started_at) < SYNC_ORPHAN_MS
+    )
+  );
+  if (running && runningFresh) {
     return {
       syncRunId: running.id,
       status: "running",
@@ -79,45 +104,71 @@ export function startSync(
     };
   }
 
-  if (running && !activeJobs.has(running.id)) {
-    // Race-safe: another request may have just inserted; if still not active, kill it.
-    db.prepare(`
-      UPDATE sync_runs
+  if (running) {
+    await run(
+      `UPDATE sync_runs
       SET status = 'error', error = ?, finished_at = ?
-      WHERE id = ? AND status = 'running'
-    `).run("同步任务已失效（服务重启或异常退出）", Date.now(), running.id);
+      WHERE id = ? AND status = 'running'`,
+      ["同步任务已失效（服务重启或异常退出）", Date.now(), running.id]
+    );
   }
 
-  const hasNotebooks = db.prepare(
-    "SELECT 1 FROM notebooks WHERE account_id = ? AND deleted_at IS NULL LIMIT 1"
-  ).get(account.id);
+  const hasNotebooks = await get<{ one: number }>(
+    "SELECT 1 AS one FROM notebooks WHERE account_id = ? AND deleted_at IS NULL LIMIT 1",
+    [account.id]
+  );
 
   const mode = opts.force ? "force" : (hasNotebooks ? "delta" : "cold");
   const now = Date.now();
 
   if (opts.force) {
-    db.prepare("UPDATE accounts SET catalog_refresh_count = 0 WHERE id = ?").run(account.id);
-    db.prepare(`
-      UPDATE book_notes_sync SET sync_status = 'pending' WHERE account_id = ?
-    `).run(account.id);
+    await run("UPDATE accounts SET catalog_refresh_count = 0 WHERE id = ?", [account.id]);
+    await run(
+      "UPDATE book_notes_sync SET sync_status = 'pending' WHERE account_id = ?",
+      [account.id]
+    );
   }
 
-  const insert = db.prepare(`
-    INSERT INTO sync_runs (account_id, mode, phase, status, books_total, books_done, started_at)
-    VALUES (?, ?, 'catalog', 'running', 0, 0, ?)
-  `).run(account.id, mode, now);
-
-  const syncRunId = Number(insert.lastInsertRowid);
-  void runSyncJob(account, creds, syncRunId, opts);
+  let syncRunId: number;
+  try {
+    const insert = await run(
+      `INSERT INTO sync_runs (account_id, mode, phase, status, books_total, books_done, started_at, last_heartbeat_at)
+      VALUES (?, ?, 'catalog', 'running', 0, 0, ?, ?)`,
+      [account.id, mode, now, now]
+    );
+    syncRunId = insert.lastInsertRowid;
+  } catch (error) {
+    if (!isUniqueConstraintError(error)) throw error;
+    const winner = await get<{ id: number; mode: string }>(
+      `SELECT id, mode FROM sync_runs
+      WHERE account_id = ? AND status = 'running'
+      ORDER BY id DESC LIMIT 1`,
+      [account.id]
+    );
+    if (!winner) throw error;
+    return {
+      syncRunId: winner.id,
+      status: "running",
+      mode: winner.mode,
+      coalesced: true
+    };
+  }
+  const job = runSyncJob(account, creds, syncRunId, opts);
+  if (process.env.VERCEL) {
+    waitUntil(job);
+  } else {
+    void job;
+  }
 
   return { syncRunId, status: "running", mode, coalesced: false };
 }
 
-export function getSyncStatus(accountId: number, syncRunId: number): SyncStatusResponse | null {
-  const row = getDb().prepare(`
-    SELECT id, status, phase, books_done, books_total, current_book_id, error
-    FROM sync_runs WHERE id = ? AND account_id = ?
-  `).get(syncRunId, accountId) as {
+export async function getSyncStatus(
+  accountId: number,
+  syncRunId: number
+): Promise<SyncStatusResponse | null> {
+  await abandonOrphanedSyncRuns();
+  const row = await get<{
     id: number;
     status: string;
     phase: string;
@@ -125,15 +176,20 @@ export function getSyncStatus(accountId: number, syncRunId: number): SyncStatusR
     books_total: number;
     current_book_id: string | null;
     error: string | null;
-  } | undefined;
+  }>(
+    `SELECT id, status, phase, books_done, books_total, current_book_id, error
+    FROM sync_runs WHERE id = ? AND account_id = ?`,
+    [syncRunId, accountId]
+  );
 
   if (!row) return null;
 
   let currentBookTitle: string | undefined;
   if (row.current_book_id) {
-    const nb = getDb().prepare(
-      "SELECT book_json FROM notebooks WHERE account_id = ? AND book_id = ?"
-    ).get(accountId, row.current_book_id) as { book_json: string } | undefined;
+    const nb = await get<{ book_json: string }>(
+      "SELECT book_json FROM notebooks WHERE account_id = ? AND book_id = ?",
+      [accountId, row.current_book_id]
+    );
     if (nb) {
       try {
         const parsed = JSON.parse(nb.book_json) as { book?: { title?: string } };
@@ -161,58 +217,66 @@ async function runSyncJob(
 ): Promise<void> {
   if (activeJobs.has(syncRunId)) return;
   activeJobs.add(syncRunId);
-  const db = getDb();
   const gateway = new WeReadGateway(creds);
-  const updatePhase = (phase: string, booksTotal = 0, booksDone = 0, currentBookId?: string) => {
-    db.prepare(`
-      UPDATE sync_runs SET phase = ?, books_total = ?, books_done = ?, current_book_id = ?
-      WHERE id = ?
-    `).run(phase, booksTotal, booksDone, currentBookId ?? null, syncRunId);
+  const updatePhase = async (
+    phase: string,
+    booksTotal = 0,
+    booksDone = 0,
+    currentBookId?: string
+  ) => {
+    await run(
+      `UPDATE sync_runs SET phase = ?, books_total = ?, books_done = ?, current_book_id = ?, last_heartbeat_at = ?
+      WHERE id = ?`,
+      [phase, booksTotal, booksDone, currentBookId ?? null, Date.now(), syncRunId]
+    );
   };
 
   try {
-    updatePhase("catalog");
+    await updatePhase("catalog");
     const catalog = await fetchFullCatalog(gateway);
-    const changed = persistCatalog(account.id, catalog);
+    const changed = await persistCatalog(account.id, catalog);
 
-    updatePhase("stats");
+    await updatePhase("stats");
     await refreshStatsIfNeeded(account.id, gateway, Boolean(opts.force));
 
-    let queue = [...new Set([...changed, ...booksNeedingFetch(account.id, Boolean(opts.force))])];
+    let queue = [...new Set([...changed, ...await booksNeedingFetch(account.id, Boolean(opts.force))])];
 
-    const accountRow = db.prepare(
-      "SELECT catalog_refresh_count FROM accounts WHERE id = ?"
-    ).get(account.id) as { catalog_refresh_count: number };
+    const accountRow = await get<{ catalog_refresh_count: number }>(
+      "SELECT catalog_refresh_count FROM accounts WHERE id = ?",
+      [account.id]
+    );
 
-    if (!opts.force && accountRow.catalog_refresh_count > 0
+    if (accountRow && !opts.force && accountRow.catalog_refresh_count > 0
       && accountRow.catalog_refresh_count % FULL_REFRESH_EVERY_N === 0) {
-      const all = db.prepare(`
-        SELECT book_id FROM notebooks WHERE account_id = ? AND deleted_at IS NULL AND note_count > 0
-      `).all(account.id) as Array<{ book_id: string }>;
-      queue = [...new Set([...queue, ...all.map((r) => r.book_id)])];
+      const allBooks = await all<{ book_id: string }>(
+        "SELECT book_id FROM notebooks WHERE account_id = ? AND deleted_at IS NULL AND note_count > 0",
+        [account.id]
+      );
+      queue = [...new Set([...queue, ...allBooks.map((r) => r.book_id)])];
     }
 
-    updatePhase("highlights", queue.length, 0);
+    await updatePhase("highlights", queue.length, 0);
     let done = 0;
     for (const bookId of queue) {
-      updatePhase("highlights", queue.length, done, bookId);
+      await updatePhase("highlights", queue.length, done, bookId);
       try {
         await syncBookHighlightsFullReplace(account.id, bookId, gateway);
       } catch (error: unknown) {
         const message = error instanceof Error ? error.message : String(error);
-        db.prepare(`
-          UPDATE book_notes_sync SET sync_status = 'error', last_error = ? WHERE account_id = ? AND book_id = ?
-        `).run(message, account.id, bookId);
+        await run(
+          "UPDATE book_notes_sync SET sync_status = 'error', last_error = ? WHERE account_id = ? AND book_id = ?",
+          [message, account.id, bookId]
+        );
       }
       done += 1;
     }
 
-    const backfill = booksNeedingFetch(account.id, false);
+    const backfill = await booksNeedingFetch(account.id, false);
     if (backfill.length > 0) {
-      updatePhase("backfill", backfill.length, 0);
+      await updatePhase("backfill", backfill.length, 0);
       let bfDone = 0;
       for (const bookId of backfill) {
-        updatePhase("backfill", backfill.length, bfDone, bookId);
+        await updatePhase("backfill", backfill.length, bfDone, bookId);
         try {
           await syncBookHighlightsFullReplace(account.id, bookId, gateway);
         } catch { /* logged in book_notes_sync */ }
@@ -220,26 +284,31 @@ async function runSyncJob(
       }
     }
 
-    const now = Date.now();
-    db.prepare(`
-      UPDATE sync_runs SET status = 'done', phase = 'done', finished_at = ? WHERE id = ?
-    `).run(now, syncRunId);
+    const finishedAt = Date.now();
+    await run(
+      "UPDATE sync_runs SET status = 'done', phase = 'done', finished_at = ? WHERE id = ?",
+      [finishedAt, syncRunId]
+    );
 
-    const run = db.prepare("SELECT mode FROM sync_runs WHERE id = ?").get(syncRunId) as { mode: string };
-    if (run.mode === "delta") {
-      db.prepare(`
-        UPDATE accounts SET catalog_refresh_count = catalog_refresh_count + 1,
-          last_sync_at = ?, updated_at = ? WHERE id = ?
-      `).run(now, now, account.id);
+    const syncRun = await get<{ mode: string }>("SELECT mode FROM sync_runs WHERE id = ?", [syncRunId]);
+    if (syncRun?.mode === "delta") {
+      await run(
+        `UPDATE accounts SET catalog_refresh_count = catalog_refresh_count + 1,
+          last_sync_at = ?, updated_at = ? WHERE id = ?`,
+        [finishedAt, finishedAt, account.id]
+      );
     } else {
-      db.prepare("UPDATE accounts SET last_sync_at = ?, updated_at = ? WHERE id = ?")
-        .run(now, now, account.id);
+      await run(
+        "UPDATE accounts SET last_sync_at = ?, updated_at = ? WHERE id = ?",
+        [finishedAt, finishedAt, account.id]
+      );
     }
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error);
-    db.prepare(`
-      UPDATE sync_runs SET status = 'error', error = ?, finished_at = ? WHERE id = ?
-    `).run(message, Date.now(), syncRunId);
+    await run(
+      "UPDATE sync_runs SET status = 'error', error = ?, finished_at = ? WHERE id = ?",
+      [message, Date.now(), syncRunId]
+    );
   } finally {
     activeJobs.delete(syncRunId);
   }
